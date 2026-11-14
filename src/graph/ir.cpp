@@ -81,6 +81,7 @@ const char* op_name(Op op) {
     case Op::MatMul: return "matmul";
     case Op::Gemm: return "gemm";
     case Op::LayerNorm: return "layer_norm";
+    case Op::Gelu: return "gelu";
     case Op::Softmax: return "softmax";
   }
   return "?";
@@ -142,6 +143,7 @@ Type infer_type(Op op, std::span<const Type> in, const Attrs& attrs) {
       return {DType::F32, r.broadcast(in[0].shape, in[1].shape)};
 
     case Op::Tanh:
+    case Op::Gelu:
       r.arity(1);
       r.require(in[0].dtype == DType::F32, "operand must be f32");
       return in[0];
@@ -302,6 +304,11 @@ Type infer_type(Op op, std::span<const Type> in, const Attrs& attrs) {
       r.arity(1);
       r.require(in[0].dtype == DType::F32, "operand must be f32");
       r.axis_in_range(attrs.axis, in[0].shape.size());
+      if (attrs.causal) {
+        size_t rank = in[0].shape.size();
+        r.require(rank >= 2 && attrs.axis == static_cast<int64_t>(rank) - 1, "causal softmax runs along the last of at least two axes");
+        r.require(in[0].shape[rank - 1] == in[0].shape[rank - 2], "causal softmax needs square [..., T, T] input");
+      }
       return in[0];
   }
   throw GraphError("infer_type: unknown op");

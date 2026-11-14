@@ -40,8 +40,8 @@ std::string attrs_string(const Node& n) {
     case Op::Slice:
       return ", axis=" + std::to_string(a.axis) + ", start=" + std::to_string(a.start) + ", end=" + std::to_string(a.end);
     case Op::Concat:
-    case Op::CumSum:
-    case Op::Softmax: return ", axis=" + std::to_string(a.axis);
+    case Op::CumSum: return ", axis=" + std::to_string(a.axis);
+    case Op::Softmax: return ", axis=" + std::to_string(a.axis) + (a.causal ? ", causal=true" : "");
     case Op::ReduceAny: return ", axis=" + std::to_string(a.axis) + ", keepdims=" + (a.keepdims ? "true" : "false");
     case Op::LayerNorm: return ", eps=" + format_double(a.eps);
     case Op::Cast: return std::string(", to=") + dtype_name(a.to);

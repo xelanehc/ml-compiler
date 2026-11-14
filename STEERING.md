@@ -60,20 +60,30 @@ Two halves. The Python exporter walks the `ExportedProgram` and serializes it wi
 
 - SSA values with static shape and dtype. Nodes are pure. Constants are first-class.
 - One node produces one value, so a value is named by its node's index. Tuple-returning ATen ops are resolved in the importer.
-- 26 ops as of M1 (`src/graph/ir.h`). Composite ops (`layer_norm`, `softmax`, `gemm` with bias) are kept whole; `gelu` arrives as primitives and is added as a composite when M3 fusion needs something to produce.
+- 27 ops (`src/graph/ir.h`). Composite ops (`layer_norm`, `softmax`, `gemm` with bias) are kept whole. `gelu` and the causal form of `softmax` are never imported; fusion produces them.
 - One function, `infer_type`, defines every op's typing rule. The builder uses it to type new nodes and the verifier uses it to re-check existing ones.
 - A text printer (`mlc dump`) and a verifier (shapes, dtypes, use-before-def). The verifier runs after import and before every interpreter run, and will run after every pass.
 - A **reference interpreter** in plain, unoptimized C++ executes any graph (`mlc run`). It is checked against PyTorch's golden logits and is then the oracle for every later stage. It frees each value after its last use and reports peak live bytes, which is the baseline memory planning has to beat.
 
-Passes, in order:
+Passes (`src/graph/passes.*`), in pipeline order. Each is a function from graph to graph built on one engine, `rewrite`, which walks the old graph in order and lets a rule replace each node while looking at operands that have already been rewritten. Dead code elimination runs after every pass, and so does the verifier.
 
 | Pass | What it does for GPT-2 |
 |---|---|
-| Canonicalize, DCE, CSE | Normalize export noise. |
-| Constant folding | Position ids, the causal mask, attention scale factors, shape arithmetic. |
-| Layout simplification | Cancel and merge reshape/permute chains around attention head split and merge. |
-| Operator fusion | Recognize GELU from its primitive expansion; matmul + bias to `gemm`; scale + mask + softmax in attention; chains of elementwise ops into one loop; residual add into the producer where legal. |
-| Memory planning | Liveness analysis, in-place reuse, then offset assignment into a single arena. Report peak arena bytes against the no-reuse total. |
+| `simplify` | Removes no-op `expand`, reshape, permute, slice; merges reshape chains; composes permute chains (the head merge is three permutes that become one); `x + 0`, `x * 1`, `not(not(x))`. |
+| `fold` | Evaluates nodes whose operands are all inline constants: position ids, the causal mask. Never folds external weights (their bytes stay in the weights file) or `Broadcast` (it would inflate a scalar), and skips results over 1 MB. |
+| `cse` | Merges identical nodes and identical constants. Each layer rebuilds the same mask and the same scalars. |
+| `gelu` | Recognizes the nine-node tanh GELU expansion and emits one `Gelu`. |
+| `attention` | Recognizes mask + softmax + all-masked-row guard and emits one causal `Softmax` on the raw scores. The mask is recognized by evaluating it at compile time, whatever computes it. |
+| `memory` | Applied at lowering (`src/loop/lower.cpp`). Liveness per value, in-place reuse for ops that read each element before writing it, then best-fit offset assignment with a coalescing free list. Reports arena bytes against the no-reuse total. |
+
+Every pass can be switched off by name (`--disable`), which is how ablations are built (`bench/ablate.py`).
+
+Fusions from the original plan that turned out not to be needed, or not yet:
+
+- **matmul + bias to `gemm`**: ATen already exports `addmm`, which imports as `gemm`.
+- **Residual add into the producer**: in-place reuse already makes the add write over its operand, so it costs no memory. Folding it into the `gemm` loop is a locality question that belongs with the GEMM kernel in M4.
+- **General elementwise chains**: after `gelu` and `attention`, the only elementwise ops left in GPT-2 are the 25 residual and embedding adds and 24 multiplies by the attention scale. There is no chain left to fuse.
+- **The transposed output projection**: the export transposes the tied embedding (154 MB) on every call before the final `mm`. Folding it would duplicate the weight; the right fix is a matmul that reads its second operand transposed, which the M4 kernel's packing step does for free. Until then that one buffer is nearly the whole arena.
 
 ### 4.3 Loop IR
 
@@ -81,7 +91,7 @@ Passes, in order:
 - Accesses are multi-dimensional (`buf[i, j, k]`); flattening to one offset happens at codegen. Loop extents are constants, since shapes are static.
 - There are no scalar variables besides loop counters. Reductions accumulate through memory and temporaries are small buffers, so every dependence is a visible load or store. Promoting those to registers is M4 work.
 - A buffer is a typed, shaped view of storage: the arena, the weights file, a caller's input or output, or inline constant data. A graph `Reshape` lowers to a second view of the same storage and no code.
-- In M2 every computed value gets its own slice of the arena, never reused. The arena size is therefore the no-reuse total that M3's memory planning is measured against.
+- Storage is decided at lowering. With memory planning off, every computed value gets its own slice of the arena; with it on (the default), slices are reused once dead. The program records both sizes.
 - Each graph op lowers to a naive loop nest (`src/loop/lower.cpp`), one kernel per node. Optimizations are explicit, composable rewrites on that nest: `split`, `tile`, `reorder`, `fuse`, `unroll`, `vectorize`, `parallelize`.
 - A **schedule** is a list of those rewrites plus parameters. The autotuner searches over schedules; it never edits IR directly.
 - A loop IR interpreter (slow, tree-walking, bounds-checking every index) is the reference for what a loop program means. In M2 it checks lowering against the graph interpreter on small graphs; from M4 it checks that a scheduled nest still computes what the naive nest did. It is far too slow for the full model, so the full model is checked in compiled form against the golden logits.
@@ -173,6 +183,7 @@ The compiler depends on the C++ standard library and nothing else. The JSON read
 
 | Item | Plan |
 |---|---|
+| The output projection's weight is transposed at run time | Open until M4. One 154 MB buffer and about 0.1 s per call; see section 4.2. |
 | GEMM cannot match Accelerate on M-series | Confirmed in M0 (see section 7). Measure our kernel standalone in M4 against both Accelerate and ONNX Runtime. Report the gap; do not hide it inside a whole-model number. |
 | `torch.compile` CPU backend on macOS arm64 may be fragile | Resolved in M0: it runs and matches golden logits. |
 | Export produces ops or patterns we did not expect | Resolved in M1: all 37 ops lower. The surprises (tied embedding transposed at run time, a mask computed from constants on every call, no-op expands, permute chains) are recorded in `docs/log.md` and are M3's work list. |

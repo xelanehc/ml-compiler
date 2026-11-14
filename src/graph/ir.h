@@ -90,7 +90,11 @@ enum class Op : uint8_t {
   // Composites. Each could be spelled with the ops above; keeping them whole
   // preserves the structure a kernel generator wants to see.
   LayerNorm,  // (x, weight, bias) normalize over the last axis. attrs.eps
-  Softmax,    // (x) along attrs.axis
+  Gelu,       // (x) 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))), the tanh approximation GPT-2 uses.
+              //     Never imported; produced by fusion from its nine-node expansion.
+  Softmax,    // (x) along attrs.axis. With attrs.causal, x is [..., T, T], the axis is the last one, and
+              //     row i is normalized over columns 0..i only; columns after i are 0. Produced by fusion
+              //     from "add a causal mask, then softmax".
 };
 
 inline constexpr int kNumOps = static_cast<int>(Op::Softmax) + 1;
@@ -109,6 +113,7 @@ struct Attrs {
   double eps = 0.0;           // LayerNorm
   DType to = DType::F32;      // Cast
   int32_t index = -1;         // Input, Const
+  bool causal = false;        // Softmax
   bool operator==(const Attrs&) const = default;
 };
 

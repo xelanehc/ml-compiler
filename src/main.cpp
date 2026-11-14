@@ -1,16 +1,20 @@
 // mlc: the compiler driver.
 //
-//   mlc dump    <graph.json>     import and print the graph IR
-//   mlc stats   <graph.json>     import and print node counts
-//   mlc run     <graph.json> --input ids.npy [--expect logits.npy] [--tol 1e-3] [--profile]
-//                                run the reference interpreter on the graph
-//   mlc loops   <graph.json>     lower to the loop IR and print it
+//   mlc dump    <graph.json> [--opt]    import and print the graph IR
+//   mlc stats   <graph.json> [--opt]    import and print node counts
+//   mlc opt     <graph.json>            run the optimization passes and report what each one did
+//   mlc run     <graph.json> --input ids.npy [--expect logits.npy] [--tol 1e-3] [--profile] [--opt]
+//                                       run the reference interpreter on the graph
+//   mlc loops   <graph.json>            lower to the loop IR and print it
 //   mlc compile <graph.json> -o <dir> [--flags "-O3 -mcpu=native"] [--emit-only]
-//                                write <dir>/model.cpp and build <dir>/model.so
+//                                       write <dir>/model.cpp and build <dir>/model.so
 //   mlc exec    <model.so> --weights w.bin --input ids.npy [--expect logits.npy]
-//                                [--tol 1e-3] [--runs N] [--profile]
-//                                load a compiled model and run it
+//                                       [--tol 1e-3] [--runs N] [--profile]
+//                                       load a compiled model and run it
 //
+// loops and compile optimize the graph first; dump, stats, and run do so with
+// --opt. Wherever the graph is optimized, --disable a,b,... turns passes off
+// (simplify, fold, cse, gelu, attention, memory, or all).
 // With --expect, run and exec compare against golden logits and exit 1 on mismatch.
 #include <algorithm>
 #include <chrono>
@@ -28,6 +32,7 @@
 #include "frontend/importer.h"
 #include "graph/interpreter.h"
 #include "graph/ir.h"
+#include "graph/passes.h"
 #include "loop/ir.h"
 #include "support/files.h"
 
@@ -38,13 +43,16 @@ namespace {
 int usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  mlc dump    <graph.json>\n"
-               "  mlc stats   <graph.json>\n"
-               "  mlc run     <graph.json> --input <ids.npy> [--expect <logits.npy>] [--tol <abs>] [--profile]\n"
+               "  mlc dump    <graph.json> [--opt]\n"
+               "  mlc stats   <graph.json> [--opt]\n"
+               "  mlc opt     <graph.json>\n"
+               "  mlc run     <graph.json> --input <ids.npy> [--expect <logits.npy>] [--tol <abs>] [--profile] [--opt]\n"
                "  mlc loops   <graph.json>\n"
                "  mlc compile <graph.json> -o <dir> [--flags \"<compiler flags>\"] [--emit-only]\n"
                "  mlc exec    <model.so> --weights <weights.bin> --input <ids.npy> [--expect <logits.npy>]\n"
-               "              [--tol <abs>] [--runs <n>] [--profile]\n");
+               "              [--tol <abs>] [--runs <n>] [--profile]\n"
+               "wherever the graph is optimized: --disable <pass,pass,...>   passes: %s\n",
+               OptOptions::pass_names());
   return 2;
 }
 
@@ -80,6 +88,28 @@ struct Options {
       if (!used[i]) throw std::runtime_error("unknown option " + args[i]);
   }
 };
+
+// Reads --disable into a set of pass switches.
+OptOptions opt_options(Options& opts) {
+  OptOptions o;
+  o.disable(opts.value("--disable"));
+  return o;
+}
+
+// Imports a graph and, if asked, optimizes it, printing one line per pass.
+ImportedModel load(const std::string& graph_path, bool optimized, const OptOptions& o, bool report = false) {
+  ImportedModel model = import_graph_file(graph_path);
+  if (!optimized) return model;
+  std::vector<PassStat> stats;
+  model.graph = optimize(model.graph, o, &stats);
+  if (report) {
+    std::printf("%-10s %7s %7s %8s\n", "pass", "before", "after", "removed");
+    for (const PassStat& s : stats)
+      std::printf("%-10s %7zu %7zu %8zd\n", s.name.c_str(), s.nodes_before, s.nodes_after,
+                  static_cast<ssize_t>(s.nodes_before) - static_cast<ssize_t>(s.nodes_after));
+  }
+  return model;
+}
 
 DType dtype_of_npy(const NpyArray& a) {
   if (a.descr == "<f4") return DType::F32;
@@ -138,10 +168,12 @@ int run(const std::string& graph_path, Options opts) {
   std::string input_path = opts.value("--input"), expect_path = opts.value("--expect");
   double tol = std::stod(opts.value("--tol", "1e-3"));
   bool profile = opts.flag("--profile");
+  bool optimized = opts.flag("--opt");
+  OptOptions o = opt_options(opts);
   opts.done();
   if (input_path.empty()) throw std::runtime_error("run needs --input");
 
-  ImportedModel model = import_graph_file(graph_path);
+  ImportedModel model = load(graph_path, optimized, o);
   std::filesystem::path weights_path = std::filesystem::path(graph_path).parent_path() / model.weights_file;
   MappedFile weights(weights_path.string());
   if (static_cast<int64_t>(weights.size()) != model.weights_bytes)
@@ -176,18 +208,19 @@ int compile(const std::string& graph_path, Options opts) {
   codegen::BuildOptions build;
   build.flags = opts.value("--flags", build.flags);
   bool emit_only = opts.flag("--emit-only");
+  OptOptions o = opt_options(opts);
   opts.done();
   if (out_dir.empty()) throw std::runtime_error("compile needs -o <dir>");
 
-  ImportedModel model = import_graph_file(graph_path);
-  loop::Program program = loop::lower_graph(model.graph, model.weights_bytes);
+  ImportedModel model = load(graph_path, true, o);
+  loop::Program program = loop::lower_graph(model.graph, model.weights_bytes, {o.memory});
   std::string source = codegen::emit_cpp(program);
 
   std::filesystem::create_directories(out_dir);
   std::string cpp_path = out_dir + "/model.cpp", so_path = out_dir + "/model.so";
   std::ofstream(cpp_path) << source;
-  std::printf("%zu graph nodes -> %zu kernels, %zu buffers, %.1f MB arena\n", model.graph.nodes.size(), program.kernels.size(),
-              program.buffers.size(), program.arena_bytes / 1e6);
+  std::printf("%zu graph nodes -> %zu kernels, %.1f MB arena (%.1f MB without reuse)\n", model.graph.nodes.size(), program.kernels.size(),
+              program.arena_bytes / 1e6, program.unplanned_arena_bytes / 1e6);
   std::printf("wrote %s (%lld lines)\n", cpp_path.c_str(), static_cast<long long>(std::count(source.begin(), source.end(), '\n')));
   if (emit_only) return 0;
 
@@ -263,21 +296,34 @@ int main(int argc, char** argv) {
   std::string command = argv[1], path = argv[2];
   Options opts(argc - 3, argv + 3);
   try {
-    if (command == "dump") {
+    if (command == "dump" || command == "stats") {
+      bool optimized = opts.flag("--opt");
+      OptOptions o = opt_options(opts);
       opts.done();
-      std::cout << print_graph(import_graph_file(path).graph);
+      ImportedModel model = load(path, optimized, o);
+      if (command == "dump") std::cout << print_graph(model.graph);
+      else std::printf("%d ATen nodes -> %s", model.aten_nodes, summarize_graph(model.graph).c_str());
       return 0;
     }
-    if (command == "stats") {
+    if (command == "opt") {
+      OptOptions o = opt_options(opts);
       opts.done();
-      ImportedModel model = import_graph_file(path);
-      std::printf("%d ATen nodes lowered to %s", model.aten_nodes, summarize_graph(model.graph).c_str());
+      ImportedModel before = import_graph_file(path);
+      ImportedModel after = load(path, true, o, /*report=*/true);
+      // Memory is planned at lowering, so lower both ways to report it.
+      loop::Program planned = loop::lower_graph(after.graph, after.weights_bytes, {o.memory});
+      loop::Program naive = loop::lower_graph(before.graph, before.weights_bytes, {false});
+      std::printf("\nnodes:   %zu -> %zu\n", before.graph.nodes.size(), after.graph.nodes.size());
+      std::printf("kernels: %zu -> %zu\n", naive.kernels.size(), planned.kernels.size());
+      std::printf("arena:   %.1f MB -> %.1f MB\n\n", naive.arena_bytes / 1e6, planned.arena_bytes / 1e6);
+      std::printf("%s", summarize_graph(after.graph).c_str());
       return 0;
     }
     if (command == "loops") {
+      OptOptions o = opt_options(opts);
       opts.done();
-      ImportedModel model = import_graph_file(path);
-      std::cout << loop::print_program(loop::lower_graph(model.graph, model.weights_bytes));
+      ImportedModel model = load(path, true, o);
+      std::cout << loop::print_program(loop::lower_graph(model.graph, model.weights_bytes, {o.memory}));
       return 0;
     }
     if (command == "run") return run(path, opts);

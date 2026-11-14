@@ -376,15 +376,20 @@ Tensor softmax(const Tensor& x, const Node& n, const Mem& mem) {
   for (int64_t o = 0; o < outer; ++o) {
     for (int64_t i = 0; i < inner; ++i) {
       const int64_t base = o * dim * inner + i;
+      // Causal: the axis is the last one (inner == 1), so `o` counts rows of
+      // every [T, T] matrix in turn, and o % dim is the row's position i.
+      // Row i takes part in columns 0..i; the rest are defined to be 0.
+      const int64_t live = n.attrs.causal ? o % dim + 1 : dim;
       float max = -std::numeric_limits<float>::infinity();
-      for (int64_t j = 0; j < dim; ++j) max = std::max(max, px[base + j * inner]);
+      for (int64_t j = 0; j < live; ++j) max = std::max(max, px[base + j * inner]);
       double sum = 0;
-      for (int64_t j = 0; j < dim; ++j) {
+      for (int64_t j = 0; j < live; ++j) {
         float e = std::exp(px[base + j * inner] - max);
         po[base + j * inner] = e;
         sum += e;
       }
-      for (int64_t j = 0; j < dim; ++j) po[base + j * inner] = static_cast<float>(po[base + j * inner] / sum);
+      for (int64_t j = 0; j < live; ++j) po[base + j * inner] = static_cast<float>(po[base + j * inner] / sum);
+      for (int64_t j = live; j < dim; ++j) po[base + j * inner] = 0.0f;
     }
   }
   return out;
@@ -411,6 +416,10 @@ Tensor execute(const Graph& g, const Node& n, std::span<const Tensor> in, std::s
     case Op::Mul: return arithmetic(in[0], in[1], n.type, mem, [](auto x, auto y) { return x * y; });
     case Op::Pow: return binary<float, float>(in[0], in[1], n.type, mem, [](float x, float y) { return std::pow(x, y); });
     case Op::Tanh: return unary<float, float>(in[0], n.type, mem, [](float x) { return std::tanh(x); });
+    case Op::Gelu:
+      return unary<float, float>(in[0], n.type, mem, [](float x) {
+        return 0.5f * x * (1.0f + std::tanh(0.7978845608028654f * (x + 0.044715f * x * x * x)));
+      });
     case Op::Eq: return comparison(in[0], in[1], n.type, mem, [](auto x, auto y) { return x == y; });
     case Op::Ne: return comparison(in[0], in[1], n.type, mem, [](auto x, auto y) { return x != y; });
     case Op::Le: return comparison(in[0], in[1], n.type, mem, [](auto x, auto y) { return x <= y; });

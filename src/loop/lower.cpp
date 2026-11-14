@@ -1,7 +1,9 @@
-// Graph IR -> loop IR. One naive loop nest per node, one buffer per value.
+// Graph IR -> loop IR: one naive loop nest per node, plus the decision of
+// where every value lives (memory planning).
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 
 #include "loop/ir.h"
 
@@ -13,99 +15,244 @@ using Idx = std::vector<ExprPtr>;
 
 constexpr int64_t kAlign = 64;  // every arena buffer starts on a cache-line boundary
 
+// Hands out byte ranges of the arena. With reuse on, a freed range goes on a
+// free list and later requests are served from it when they fit; the arena
+// only grows when nothing on the list is big enough.
+class ArenaPlanner {
+ public:
+  explicit ArenaPlanner(bool reuse) : reuse_(reuse) {}
+
+  int64_t alloc(int64_t bytes) {
+    const int64_t size = round_up(bytes);
+    total_ += size;
+    if (reuse_) {
+      // Best fit: the smallest free block that is large enough. Taking a
+      // snug block leaves the big ones for the big tensors still to come.
+      auto best = free_.end();
+      for (auto it = free_.begin(); it != free_.end(); ++it)
+        if (it->second >= size && (best == free_.end() || it->second < best->second)) best = it;
+      if (best != free_.end()) {
+        int64_t offset = best->first, left = best->second - size;
+        free_.erase(best);
+        if (left > 0) free_[offset + size] = left;
+        return offset;
+      }
+      // Nothing fits. If the last free block touches the end of the arena,
+      // grow the arena by only the difference.
+      if (!free_.empty()) {
+        auto last = std::prev(free_.end());
+        if (last->first + last->second == end_) {
+          int64_t offset = last->first;
+          free_.erase(last);
+          end_ = offset + size;
+          return offset;
+        }
+      }
+    }
+    int64_t offset = end_;
+    end_ += size;
+    return offset;
+  }
+
+  void release(int64_t offset, int64_t bytes) {
+    const int64_t size = round_up(bytes);
+    if (!reuse_ || size == 0) return;
+    auto it = free_.emplace(offset, size).first;
+    // Merge with the neighbours so that two small holes side by side can
+    // serve one large request.
+    auto next = std::next(it);
+    if (next != free_.end() && it->first + it->second == next->first) {
+      it->second += next->second;
+      free_.erase(next);
+    }
+    if (it != free_.begin()) {
+      auto prev = std::prev(it);
+      if (prev->first + prev->second == it->first) {
+        prev->second += it->second;
+        free_.erase(it);
+      }
+    }
+  }
+
+  int64_t peak_bytes() const { return end_; }    // the arena size: the furthest any allocation reached
+  int64_t total_bytes() const { return total_; } // the sum of every allocation: the size with no reuse
+
+ private:
+  static int64_t round_up(int64_t bytes) { return (bytes + kAlign - 1) / kAlign * kAlign; }
+  bool reuse_;
+  int64_t end_ = 0, total_ = 0;
+  std::map<int64_t, int64_t> free_;  // offset -> size, ordered by offset
+};
+
 class Lowerer {
  public:
-  Lowerer(const Graph& g, int64_t weights_bytes) : g_(g) { p_.weights_bytes = weights_bytes; }
+  Lowerer(const Graph& g, int64_t weights_bytes, const LowerOptions& options) : g_(g), options_(options), arena_(options.plan_memory) {
+    p_.weights_bytes = weights_bytes;
+  }
 
   Program run() {
     check_graph(g_);
     for (ValueId in : g_.inputs) p_.inputs.push_back(g_.type_of(in));
     for (ValueId out : g_.outputs) p_.outputs.push_back(g_.type_of(out));
-    assign_storage();
-    for (ValueId v = 0; v < g_.nodes.size(); ++v) lower_node(v);
+    analyze();
+    for (ValueId v = 0; v < g_.nodes.size(); ++v) {
+      place(v);
+      lower_node(v);
+      release_after(v);
+    }
     copy_unowned_outputs();
+    p_.arena_bytes = arena_.peak_bytes();
+    p_.unplanned_arena_bytes = arena_.total_bytes();
     check_program(p_);
     return std::move(p_);
   }
 
  private:
+  struct Block {
+    int64_t offset = 0, bytes = 0;
+  };
+
   const Graph& g_;
+  LowerOptions options_;
   Program p_;
+  ArenaPlanner arena_;
   std::vector<BufferId> buffer_of_;       // graph value -> its buffer
+  std::vector<ValueId> root_;             // graph value -> the value that owns its bytes (itself, unless a Reshape)
+  std::vector<int> output_of_;            // root -> index of the graph output computed into it, or -1
+  std::vector<int64_t> last_use_;         // root -> index of the last node that reads it, or -1 if none
+  std::vector<bool> owns_arena_;          // root -> holds an arena block right now
+  std::vector<Block> block_;              // root -> that block
+  std::vector<Block> temps_;              // scratch blocks of the node being lowered
   std::vector<int> copy_outputs_;         // outputs that need an explicit copy at the end
   VarId next_var_ = 0;
 
   // ---- Storage ----
-
-  int64_t arena_alloc(const Type& type) {
-    int64_t offset = p_.arena_bytes;
-    int64_t bytes = static_cast<int64_t>(type.byte_size());
-    p_.arena_bytes = (offset + bytes + kAlign - 1) / kAlign * kAlign;
-    return offset;
-  }
 
   BufferId new_buffer(std::string name, const Type& type, Storage storage, int64_t offset, int32_t index) {
     p_.buffers.push_back(Buffer{std::move(name), type.dtype, type.shape, storage, offset, index});
     return static_cast<BufferId>(p_.buffers.size() - 1);
   }
 
-  BufferId arena_buffer(std::string name, const Type& type) {
-    int64_t offset = arena_alloc(type);
-    return new_buffer(std::move(name), type, Storage::Arena, offset, -1);
-  }
-
-  // Decides where every value lives. A Reshape does not get storage of its
-  // own: it is the same bytes as its operand under a different shape, so it
-  // shares the operand's storage and costs nothing at run time. `root` follows
-  // such chains back to the value that actually owns the bytes.
+  // Liveness analysis. For every value that owns bytes, find the last node
+  // that reads it. Kernels run in node order, so a value's lifetime is the
+  // interval from its own index to that last reader's index, and two values
+  // may share memory exactly when their intervals do not overlap.
   //
-  // Everything else is as simple as it can be: each computed value gets a
-  // fresh slice of the arena that is never reused. The arena is therefore as
-  // large as the sum of all intermediates. Memory planning (M3) shrinks it.
-  void assign_storage() {
+  // A Reshape does not own bytes: it is the same bytes as its operand under a
+  // different shape. `root_` follows such chains back to the owner, and a read
+  // of the reshaped value counts as a read of the owner.
+  void analyze() {
     const size_t n = g_.nodes.size();
-    std::vector<ValueId> root(n);
-    for (ValueId v = 0; v < n; ++v) root[v] = g_.nodes[v].op == Op::Reshape ? root[g_.nodes[v].inputs[0]] : v;
+    root_.resize(n);
+    for (ValueId v = 0; v < n; ++v) root_[v] = g_.nodes[v].op == Op::Reshape ? root_[g_.nodes[v].inputs[0]] : v;
+
+    last_use_.assign(n, -1);
+    for (ValueId v = 0; v < n; ++v)
+      for (ValueId in : g_.nodes[v].inputs) last_use_[root_[in]] = v;
 
     // A value the caller wants back is computed straight into the caller's
     // buffer when possible. It is not possible when the value is an input or
     // a constant, or when two outputs are the same value; those get a copy.
-    std::vector<int> output_of(n, -1);
+    output_of_.assign(n, -1);
     for (size_t k = 0; k < g_.outputs.size(); ++k) {
-      ValueId r = root[g_.outputs[k]];
+      ValueId r = root_[g_.outputs[k]];
       Op op = g_.nodes[r].op;
-      if (op != Op::Input && op != Op::Const && output_of[r] < 0) output_of[r] = static_cast<int>(k);
+      if (op != Op::Input && op != Op::Const && output_of_[r] < 0) output_of_[r] = static_cast<int>(k);
       else copy_outputs_.push_back(static_cast<int>(k));
     }
 
-    struct Place {
-      Storage storage;
-      int64_t offset;
-      int32_t index;
-    };
-    std::vector<Place> place(n);
-    buffer_of_.resize(n);
-    for (ValueId v = 0; v < n; ++v) {
-      const Node& node = g_.nodes[v];
-      if (root[v] != v) {
-        place[v] = place[root[v]];
-      } else if (node.op == Op::Input) {
-        place[v] = {Storage::Input, 0, node.attrs.index};
-      } else if (node.op == Op::Const) {
-        const Constant& c = g_.constants[node.attrs.index];
-        if (c.is_external()) {
-          place[v] = {Storage::Weights, c.weights_offset, -1};
-        } else {
-          p_.inline_data.push_back(c.inline_data);
-          place[v] = {Storage::Inline, 0, static_cast<int32_t>(p_.inline_data.size() - 1)};
-        }
-      } else if (output_of[v] >= 0) {
-        place[v] = {Storage::Output, 0, output_of[v]};
-      } else {
-        place[v] = {Storage::Arena, arena_alloc(node.type), -1};
-      }
-      buffer_of_[v] = new_buffer("v" + std::to_string(v), node.type, place[v].storage, place[v].offset, place[v].index);
+    buffer_of_.assign(n, -1);
+    owns_arena_.assign(n, false);
+    block_.assign(n, {});
+  }
+
+  // Ops whose kernel reads each operand element at the same index it then
+  // writes, and never reads it again afterwards. Such an op can write its
+  // result over an operand: by the time out[i] is stored, in[i] has been used.
+  static bool can_run_in_place(Op op) {
+    switch (op) {
+      case Op::Add: case Op::Sub: case Op::Mul: case Op::Pow: case Op::Tanh: case Op::Gelu:
+      case Op::And: case Op::Not: case Op::Where: case Op::LayerNorm: case Op::Softmax:
+        return true;
+      default:
+        return false;
     }
+  }
+
+  // In-place reuse: if this node is the last reader of an operand that has
+  // exactly the node's own type, the result takes over the operand's memory.
+  // Returns the operand's root, or kNoValue.
+  ValueId in_place_operand(ValueId v) const {
+    const Node& n = g_.nodes[v];
+    if (!options_.plan_memory || !can_run_in_place(n.op)) return kNoValue;
+    for (ValueId in : n.inputs) {
+      ValueId r = root_[in];
+      if (!owns_arena_[r] || last_use_[r] != static_cast<int64_t>(v) || g_.type_of(in) != n.type) continue;
+      // Every operand that views the same bytes must be read at the output's
+      // own index. A broadcast or reshaped second view would read elements
+      // the kernel has already overwritten.
+      bool safe = true;
+      for (ValueId other : n.inputs)
+        if (root_[other] == r && g_.type_of(other).shape != n.type.shape) safe = false;
+      if (safe) return r;
+    }
+    return kNoValue;
+  }
+
+  // Decides where value `v` lives and creates its buffer.
+  void place(ValueId v) {
+    const Node& node = g_.nodes[v];
+    Storage storage = Storage::Arena;
+    int64_t offset = 0;
+    int32_t index = -1;
+    if (root_[v] != v) {
+      const Buffer& owner = p_.buffers[buffer_of_[root_[v]]];
+      storage = owner.storage;
+      offset = owner.offset;
+      index = owner.index;
+    } else if (node.op == Op::Input) {
+      storage = Storage::Input;
+      index = node.attrs.index;
+    } else if (node.op == Op::Const) {
+      const Constant& c = g_.constants[node.attrs.index];
+      if (c.is_external()) {
+        storage = Storage::Weights;
+        offset = c.weights_offset;
+      } else {
+        p_.inline_data.push_back(c.inline_data);
+        storage = Storage::Inline;
+        index = static_cast<int32_t>(p_.inline_data.size() - 1);
+      }
+    } else if (output_of_[v] >= 0) {
+      storage = Storage::Output;
+      index = output_of_[v];
+    } else {
+      ValueId donor = in_place_operand(v);
+      if (donor != kNoValue) {
+        block_[v] = block_[donor];
+        owns_arena_[donor] = false;  // ownership moves; the donor must not free it
+      } else {
+        block_[v] = {arena_.alloc(static_cast<int64_t>(node.type.byte_size())), static_cast<int64_t>(node.type.byte_size())};
+      }
+      owns_arena_[v] = true;
+      offset = block_[v].offset;
+    }
+    buffer_of_[v] = new_buffer("v" + std::to_string(v), node.type, storage, offset, index);
+  }
+
+  // After node `v` has been lowered: its scratch space is free again, and so
+  // is every operand that `v` was the last reader of.
+  void release_after(ValueId v) {
+    for (const Block& t : temps_) arena_.release(t.offset, t.bytes);
+    temps_.clear();
+    auto drop = [&](ValueId r) {
+      if (!owns_arena_[r]) return;
+      arena_.release(block_[r].offset, block_[r].bytes);
+      owns_arena_[r] = false;
+    };
+    for (ValueId in : g_.nodes[v].inputs)
+      if (last_use_[root_[in]] == static_cast<int64_t>(v)) drop(root_[in]);
+    if (root_[v] == v && last_use_[v] < 0) drop(v);  // computed but never read
   }
 
   // ---- Building blocks ----
@@ -168,9 +315,13 @@ class Lowerer {
 
   StmtPtr write(ValueId v, const Idx& idx, ExprPtr value) { return make_store(buffer_of_[v], idx, std::move(value)); }
 
-  // A scratch buffer for an op that needs a temporary (a running maximum, a mean).
+  // A scratch buffer for an op that needs a temporary (a running maximum, a
+  // mean). It lives only while its own kernel runs.
   BufferId temp(ValueId v, const char* what, DType dtype, const Shape& shape) {
-    return arena_buffer("t" + std::to_string(v) + "_" + what, {dtype, shape});
+    Type type{dtype, shape};
+    Block b{arena_.alloc(static_cast<int64_t>(type.byte_size())), static_cast<int64_t>(type.byte_size())};
+    temps_.push_back(b);
+    return new_buffer("t" + std::to_string(v) + "_" + what, type, Storage::Arena, b.offset, -1);
   }
 
   static Idx concat_idx(const Idx& a, const ExprPtr& b) {
@@ -377,18 +528,28 @@ class Lowerer {
     ValueId x = n.inputs[0];
     BufferId max = temp(v, "max", DType::F32, rest);
     BufferId sum = temp(v, "sum", DType::F32, rest);
+    const ExprPtr minus_inf = float_imm(-std::numeric_limits<double>::infinity());
     return nest(rest, [&](const Idx& r) {
       ExprPtr max_r = load(max, DType::F32, r);
       ExprPtr sum_r = load(sum, DType::F32, r);
       auto at = [&](const ExprPtr& j) { return insert_at(r, axis, j); };
       auto out = [&](const ExprPtr& j) { return load(buffer_of_[v], DType::F32, at(j)); };
+      // Causal: the axis is the last one, so the last loop index in `r` is the
+      // row i, and column j takes part only when j <= i. A masked column
+      // contributes -inf to the maximum and 0 to the sum, and its exp is
+      // never evaluated. (A loop that simply stopped at i would be better; it
+      // needs a loop bound that depends on an outer variable, which this IR
+      // does not have yet.)
+      auto when_live = [&](const ExprPtr& j, ExprPtr value, ExprPtr otherwise) {
+        return n.attrs.causal ? select(binary(BinOp::Le, j, r.back()), std::move(value), std::move(otherwise)) : value;
+      };
       return make_block({
-          make_store(max, r, float_imm(-std::numeric_limits<double>::infinity())),
-          loop(dim, [&](const ExprPtr& j) { return make_store(max, r, binary(BinOp::Max, max_r, read(x, at(j)))); }),
+          make_store(max, r, minus_inf),
+          loop(dim, [&](const ExprPtr& j) { return make_store(max, r, binary(BinOp::Max, max_r, when_live(j, read(x, at(j)), minus_inf))); }),
           make_store(sum, r, float_imm(0)),
           loop(dim, [&](const ExprPtr& j) {
             return make_block({
-                write(v, at(j), call(Intrinsic::Exp, {sub(read(x, at(j)), max_r)})),
+                write(v, at(j), when_live(j, call(Intrinsic::Exp, {sub(read(x, at(j)), max_r)}), float_imm(0))),
                 make_store(sum, r, add(sum_r, out(j))),
             });
           }),
@@ -416,6 +577,14 @@ class Lowerer {
       case Op::And: return emit(v, binary_op(v, BinOp::And));
       case Op::Pow: return emit(v, elementwise(v, [](X x) { return call(Intrinsic::Pow, {x[0], x[1]}); }));
       case Op::Tanh: return emit(v, elementwise(v, [](X x) { return call(Intrinsic::Tanh, {x[0]}); }));
+      case Op::Gelu:
+        // 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) in one pass, with
+        // x^3 as two multiplies rather than a call to pow.
+        return emit(v, elementwise(v, [](X x) {
+          ExprPtr cube = mul(mul(x[0], x[0]), x[0]);
+          ExprPtr inner = mul(add(x[0], mul(cube, float_imm(0.044715))), float_imm(0.7978845608028654));
+          return mul(mul(x[0], float_imm(0.5)), add(call(Intrinsic::Tanh, {inner}), float_imm(1)));
+        }));
       case Op::Not: return emit(v, elementwise(v, [](X x) { return logical_not(x[0]); }));
       case Op::Where: return emit(v, elementwise(v, [](X x) { return select(x[0], x[1], x[2]); }));
       case Op::Cast: return emit(v, elementwise(v, [&](X x) { return cast(n.attrs.to, x[0]); }));
@@ -450,6 +619,6 @@ class Lowerer {
 
 }  // namespace
 
-Program lower_graph(const Graph& g, int64_t weights_bytes) { return Lowerer(g, weights_bytes).run(); }
+Program lower_graph(const Graph& g, int64_t weights_bytes, const LowerOptions& options) { return Lowerer(g, weights_bytes, options).run(); }
 
 }  // namespace mlc::loop

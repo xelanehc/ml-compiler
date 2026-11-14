@@ -146,7 +146,8 @@ struct Program {
   std::vector<Buffer> buffers;
   std::vector<std::vector<std::byte>> inline_data;
   std::vector<Kernel> kernels;
-  int64_t arena_bytes = 0;
+  int64_t arena_bytes = 0;            // size of the arena the program needs
+  int64_t unplanned_arena_bytes = 0;  // what it would need if no buffer ever shared memory with another
   int64_t weights_bytes = 0;
   std::vector<Type> inputs;   // what the caller must pass, in order
   std::vector<Type> outputs;
@@ -170,10 +171,16 @@ void check_program(const Program& p);
 
 // ---- Lowering and execution ---------------------------------------------------------
 
-// Lowers every graph node to a naive loop nest and gives every value its own
-// buffer. No reuse of memory, no fusion, no reordering: this is the baseline
-// that later milestones are measured against.
-Program lower_graph(const Graph& g, int64_t weights_bytes);
+struct LowerOptions {
+  // Memory planning: reuse arena space once a value is dead, and let an
+  // elementwise op write over an operand it is the last reader of. When off,
+  // every value gets arena space of its own, as in M2.
+  bool plan_memory = true;
+};
+
+// Lowers every graph node to a naive loop nest, one kernel per node, and
+// decides where every value lives.
+Program lower_graph(const Graph& g, int64_t weights_bytes, const LowerOptions& options = {});
 
 // Tree-walking interpreter. Slow, and checks every index against its
 // buffer's bounds. `inputs` and `outputs` are raw pointers to caller memory

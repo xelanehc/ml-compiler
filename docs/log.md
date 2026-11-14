@@ -115,3 +115,74 @@ Profile at T=1024 (`mlc exec ... --profile`, one run): `gemm` 30.5 s (77.5%), `m
 **Open**
 
 - Rerun the M0 baselines on AC so the tables share a power state.
+
+## M3: graph optimizations (2026-11-13)
+
+**Built**
+
+- `src/graph/passes.*`: a rewriting engine (`rewrite`: walk the old graph in order, build a new one, each rule sees operands that are already rewritten) and the passes on top of it: `simplify`, `fold`, `cse`, `gelu`, `attention`, plus dead code elimination after each. `evaluate_constant` runs any input-free subgraph in the interpreter at compile time.
+- Graph IR: a `Gelu` op and a causal form of `Softmax` (`attrs.causal`), both produced only by fusion.
+- `src/loop/lower.cpp`: memory planning. Liveness per value, in-place reuse, best-fit offsets with a coalescing free list. Lowerings for `Gelu` and causal softmax.
+- `mlc opt` (per-pass report), `--opt` on `dump` / `stats` / `run`, `--disable <passes>` wherever the graph is optimized. `compile` and `loops` optimize by default.
+- `bench/ablate.py`: cumulative and leave-one-out ablations.
+- 25 new unit tests (83 total): each pass fires where it should and holds back on lookalikes, each has a differential test, the planner is checked for reuse, in-place safety, and bit-identical results with planning on and off. `ctest` gained `optimized_T<T>` (the interpreter on the optimized real graph against golden logits) and an unoptimized compile-and-run at T=16.
+
+**Numbers**
+
+Graph size, identical at every `T` (`mlc opt artifacts/graphs/gpt2_T16.json`):
+
+| pass | nodes before | nodes after | removed |
+|---|---:|---:|---:|
+| simplify | 1062 | 951 | 111 |
+| fold | 951 | 902 | 49 |
+| cse | 902 | 780 | 122 |
+| gelu | 780 | 691 | 89 |
+| attention | 691 | 615 | 76 |
+
+Kernels go from 541 to 258; generated C++ compiles in 3 to 5 s instead of 10 to 17 s. What is left: 73 matrix products, 49 permutes, 36 slices, 25 layer norms, 25 adds, 24 multiplies, 12 GELUs, 12 softmaxes, 2 gathers, and 206 reshapes that cost nothing.
+
+Arena (MB), cumulative, from `bench/results/m3_ablation_cumulative.md` and `m3_ablation_T1024.md`:
+
+| passes | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| none | 191.6 | 314.8 | 982.5 | 6452.9 |
+| + simplify | 187.9 | 298.2 | 888.0 | |
+| + fold | 187.9 | 298.0 | 884.6 | |
+| + cse | 187.7 | 295.9 | 850.0 | |
+| + gelu | 171.2 | 229.8 | 585.8 | |
+| + attention | 170.8 | 223.7 | 488.2 | |
+| + memory | 154.4 | 154.6 | 155.2 | 157.5 |
+
+Time (s, minimum over timed runs, one thread, on battery):
+
+| passes | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| none | 1.044 | 3.937 | 15.247 | 65.21 |
+| + simplify | 1.044 | 3.916 | 15.290 | |
+| + fold | 1.052 | 3.925 | 15.520 | |
+| + cse | 1.049 | 3.892 | 15.613 | |
+| + gelu | 1.040 | 4.048 | 15.470 | |
+| + attention | 1.050 | 3.949 | 15.645 | |
+| + memory | 1.049 | 3.978 | 15.460 | 63.98 |
+
+T=1024 was measured at the two ends only (2 timed runs each). Leave-one-out at T=64 (`m3_ablation_leave_one_out.md`) agrees: every row is within 2% of the full build.
+
+Single profiled runs at T=256 (`mlc exec --profile`), all passes off against all on: time outside matrix products went from 0.476 s to 0.364 s; matrix products were 14.8 s and 16.4 s, which is run-to-run noise on battery.
+
+All four sequence lengths match PyTorch after optimization, in the interpreter and compiled (max abs diff 1.4e-4 to 2.4e-4).
+
+**Surprises**
+
+- No pass produces a measurable speedup. The differences in the time table are within noise (up to 3%, in both directions). Matrix products are 97% of the run, and the graph passes do not touch them. The passes removed about a quarter of everything else, and a quarter of 3% does not show. Per-pass attribution of speed is therefore "none, yet"; what the passes bought is graph size, memory, and compile time. Their effect on speed has to be re-measured after M4, when the matrix products stop hiding everything else.
+- These numbers are slower than the M2 entry (15.2 s against 9.0 s at T=256 for the same unoptimized build) because this session ran on battery and M2's benchmark ran on AC. Within this entry everything shares a power state.
+- Memory planning is the large effect: 41x at T=1024 (6453 MB to 157.5 MB). The first call at T=1024 no longer pays for faulting in 6 GB.
+- After planning, the arena is almost the same size at every `T`, about 154 MB, because one buffer sets it: the transposed copy of the output projection weight (50257 x 768 floats = 154.4 MB), which exists only for the final `mm`. All twelve layers together fit in the few MB above that at T=1024. Removing that transpose is now the single biggest memory item, and it needs a matmul that reads its operand transposed (M4).
+- Fusing GELU did not make GELU faster in any way that matters: nine nodes took about 0.2 s at T=256 and the one fused node takes 0.13 s, because `tanh` is most of the cost either way. Its real effect is memory: seven fewer `[1, T, 3072]` buffers per layer, visible as the biggest single drop in the arena column before planning.
+- CSE removed 122 nodes but only 11 kernels: nearly all of what it merged was duplicate scalar constants, which never had code.
+- The constant-folding size cap behaves as intended at T=1024: the 4 MB mask is not folded (24 nodes removed instead of 49), the attention fusion still recognizes it by evaluating it on the side, and dead code elimination then removes the unfolded mask computation. The final graph is the same 615 nodes at every `T`.
+- A unit test "failed" because folding evaluated a whole attention layer whose scores were a constant in the test. The pass was right and the test was wrong.
+
+**Open**
+
+- Rerun the baselines and the ablation on AC power.
+- Re-run the ablation after M4.
