@@ -4,7 +4,7 @@ A small ahead-of-time ML compiler that runs GPT-2 small on a CPU.
 
 It takes the real PyTorch model through `torch.export`, lowers it into its own graph IR, optimizes the graph, lowers again to a loop-level IR, applies tiling, vectorization, and multi-threading, and emits C++ with SIMD intrinsics. An autotuner picks kernel parameters by measurement. The compiler itself is written in C++, and the code it generates calls no BLAS library.
 
-**Status:** M0 complete (baselines measured, golden outputs saved). The compiler itself is not written yet. See [STEERING.md](STEERING.md) for the design, milestones, and exit criteria.
+**Status:** M1 complete. The exported GPT-2 graph imports into the graph IR, and the reference interpreter reproduces PyTorch's logits at every sequence length. Nothing is optimized or compiled to native code yet. See [STEERING.md](STEERING.md) for the design, milestones, and exit criteria.
 
 ## Pipeline
 
@@ -30,7 +30,7 @@ A GPU backend that emits Triton kernels from the same graph IR comes last.
 | # | Milestone | Status |
 |---|---|---|
 | M0 | Baselines and benchmark harness | done |
-| M1 | Frontend, graph IR, reference interpreter | not started |
+| M1 | Frontend, graph IR, reference interpreter | done |
 | M2 | Naive end-to-end scalar codegen | not started |
 | M3 | Graph optimizations | not started |
 | M4 | Loop optimizations and SIMD kernels | not started |
@@ -67,11 +67,28 @@ python3 -m venv .venv
 ## Usage
 
 ```sh
-# Export GPT-2, verify the exported graph, save golden inputs and logits (about 260 MB under artifacts/)
+# Export GPT-2, verify the exported graph, save golden logits, graphs and weights (about 760 MB under artifacts/)
 .venv/bin/python export/export_gpt2.py
 
 # Benchmark the baselines; writes bench/results/baselines.md
 .venv/bin/python bench/run.py
+
+# Build the compiler (optimized) and run its tests
+cmake -S . -B build/release
+cmake --build build/release -j
+ctest --test-dir build/release --output-on-failure            # add -LE slow to skip T=256 and T=1024
+
+# Print the graph IR for one sequence length
+build/release/mlc dump artifacts/graphs/gpt2_T16.json | less
+
+# Run the reference interpreter against PyTorch's golden logits, with a per-op time breakdown
+build/release/mlc run artifacts/graphs/gpt2_T16.json \
+    --input artifacts/golden/T16_ids.npy --expect artifacts/golden/T16_logits.npy --profile
+
+# The same tests under AddressSanitizer and UndefinedBehaviorSanitizer (slow: debug build)
+cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug -DMLC_SANITIZE=ON
+cmake --build build/asan -j
+ctest --test-dir build/asan -R "unit|golden_T16" --output-on-failure
 ```
 
 The first run downloads the GPT-2 weights from Hugging Face. The full benchmark takes several minutes; add `--seq-lens 16 64` for a quick pass.
@@ -80,7 +97,7 @@ The first run downloads the GPT-2 weights from Hugging Face. The full benchmark 
 
 ```
 export/       Python: torch.export -> graph.json + weights.bin
-src/          the compiler (C++): frontend, graph, loop, codegen, tune, gpu
+src/          the compiler (C++): frontend, graph, support; later loop, codegen, tune, gpu
 runtime/      handwritten C++ linked into generated code: arena, thread pool, weight loader
 bench/        Python benchmark harness and baselines
 tests/

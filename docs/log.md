@@ -32,3 +32,45 @@ Export: 517 nodes as traced, 852 after decomposition to core ATen, 37 distinct o
 **Open**
 
 - Rerun `bench/run.py` on AC power and replace the provisional table.
+
+## M1: frontend, graph IR, interpreter (2026-11-12)
+
+**Built**
+
+- `export/serialize.py`: writes each exported program as `artifacts/graphs/gpt2_T<T>.json` plus one shared `gpt2_weights.bin` (498 MB, tensors 64-byte aligned, tied weights stored once). It records ATen ops and arguments as they are and interprets nothing.
+- `src/support/`: a strict JSON reader that keeps ints and floats apart, `mmap` for the weights, a `.npy` reader.
+- `src/graph/ir.*`: the graph IR. 26 ops, one value per node, static dtype and shape. `infer_type` is the single definition of every op's typing rule.
+- `src/graph/printer.cpp`, `verifier.cpp`: text dump; structural and type checks.
+- `src/graph/interpreter.*`: reference interpreter. Frees values after their last use; reports per-op time and peak live memory.
+- `src/frontend/importer.*`: lowers all 37 ATen ops. Rejects unknown ops and unread arguments; checks every inferred type against the exported one.
+- `src/main.cpp`: `mlc dump | stats | run`.
+- 40 unit tests and four end-to-end golden tests under `ctest`; an ASan + UBSan configuration.
+
+**Numbers** (release build, one thread, on battery)
+
+| T | max abs logit diff vs PyTorch | argmax mismatches | interpreter time | PyTorch eager, 1 thread (M0) | peak live memory | allocated in total |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 | 1.45e-04 | 0 of 16 | 0.56 s | 0.038 s | 158 MB | 195 MB |
+| 64 | 1.14e-04 | 0 of 64 | 1.55 s | 0.109 s | 168 MB | 328 MB |
+| 256 | 2.14e-04 | 0 of 256 | 5.86 s | 0.458 s | 207 MB | 1034 MB |
+| 1024 | 1.45e-04 | 0 of 1024 | 27.4 s | 1.12 s | 363 MB | 6657 MB |
+
+Tolerance is 1e-3. The differences are the same size as PyTorch's own export-versus-eager difference (about 1e-4), so they are fp32 summation order, not a bug.
+
+Graph size: 852 ATen nodes become 1062 IR nodes. Of those, 290 are constants (148 weight tensors, the rest scalars and index tables), 230 reshapes, 85 permutes, 61 broadcasts; 73 are matrix products (48 `gemm`, 25 `matmul`).
+
+Reproduce: `ctest --test-dir build/release --output-on-failure`, or `build/release/mlc run artifacts/graphs/gpt2_T<T>.json --input artifacts/golden/T<T>_ids.npy --expect artifacts/golden/T<T>_logits.npy --profile`.
+
+**Surprises**
+
+- The graph grew on import (852 to 1062). ATen passes Python scalars as arguments; in our IR every operand is a value, so each `0.5` becomes a constant node. `clone`, `alias`, `getitem`, and the metadata assertions go the other way and produce no node.
+- The token embedding and the output projection are one tensor. The export looks it up as rows for the embedding and then, at the very end, transposes all of it (`permute` of `[50257, 768]`, 154 MB) for the final `mm`. That one node was 37% of a profiled T=16 run and sets peak memory at every `T` below 1024. It has no dependence on the input, so it is the first thing constant folding should remove, or better, the final product should read the weight transposed in place.
+- About 40 nodes at the top of the graph rebuild the causal mask from `arange`, `cumsum`, and comparisons on every call. None of it depends on the input.
+- Every attention layer carries a guard for rows that are masked everywhere (`eq -inf`, `not`, `reduce_any`, `not`, `where`): several full `[1,12,T,T]` passes per layer that can never fire with a causal mask, since position `i` can always attend to itself. At T=1024, `where` and `broadcast` alone are 1.7 s.
+- All 49 `expand` nodes are no-ops (target shape equals the input shape), and the head merge is three permutes in a row that compose to one.
+- GELU arrives as eight primitive nodes per layer, each a full pass over `[1, T, 3072]`.
+- With the naive `i, p, j` loop the two matrix-product ops are 79% of the T=1024 run (21.6 s). Everything else is the remaining 5.8 s, which is roughly five times PyTorch's entire forward pass. Both halves need work, and the non-GEMM half is not small.
+
+**Open**
+
+- Baseline and interpreter timings above were taken on battery. Rerun on AC before quoting them.

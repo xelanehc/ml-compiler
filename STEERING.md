@@ -54,14 +54,16 @@ These are fixed unless this section is edited.
 
 ### 4.1 Frontend
 
-Two halves. The Python exporter walks the `ExportedProgram` and serializes it without interpreting it: nodes, ATen op names, attributes, shapes, dtypes, and weight offsets. The C++ importer reads that file and lowers ATen ops to the graph IR. An unsupported op is a hard error naming the op; no silent fallbacks. The set GPT-2 needs is small (embedding, linear/addmm, matmul, layer norm, softmax, the tanh-form GELU, reshapes, permutes, split, masking, elementwise arithmetic). The exact list is established by dumping the export in M1, not assumed.
+Two halves. The Python exporter walks the `ExportedProgram` and serializes it without interpreting it: nodes, ATen op names, attributes, shapes, dtypes, and weight offsets. The C++ importer reads that file and lowers ATen ops to the graph IR. An unsupported op is a hard error naming the op; no silent fallbacks. The export uses 37 distinct ATen operators (listed in `docs/export_ops.md`); the importer lowers all of them, and the table of lowerings in `src/frontend/importer.cpp` is the complete accepted surface. Arguments are held to the same rule as operators: an argument or keyword the lowering does not read is an error. Every lowered node's inferred type is compared with the type `torch.export` recorded, so our shape inference is checked against PyTorch's on the real model at every import.
 
 ### 4.2 Graph IR
 
 - SSA values with static shape and dtype. Nodes are pure. Constants are first-class.
-- Roughly 15 to 20 ops. Composite ops (`gelu`, `layer_norm`, `softmax`, `gemm` with bias) exist so that fusion has something to produce.
-- A text printer and a verifier (shapes, dtypes, use-before-def) run after every pass in debug mode.
-- A **reference interpreter** in plain, unoptimized C++ executes any graph. It is checked against PyTorch's golden logits and is then the oracle for every later stage.
+- One node produces one value, so a value is named by its node's index. Tuple-returning ATen ops are resolved in the importer.
+- 26 ops as of M1 (`src/graph/ir.h`). Composite ops (`layer_norm`, `softmax`, `gemm` with bias) are kept whole; `gelu` arrives as primitives and is added as a composite when M3 fusion needs something to produce.
+- One function, `infer_type`, defines every op's typing rule. The builder uses it to type new nodes and the verifier uses it to re-check existing ones.
+- A text printer (`mlc dump`) and a verifier (shapes, dtypes, use-before-def). The verifier runs after import and before every interpreter run, and will run after every pass.
+- A **reference interpreter** in plain, unoptimized C++ executes any graph (`mlc run`). It is checked against PyTorch's golden logits and is then the oracle for every later stage. It frees each value after its last use and reports peak live bytes, which is the baseline memory planning has to beat.
 
 Passes, in order:
 
@@ -155,13 +157,13 @@ src/
   main.cpp      the `mlc` driver
 runtime/        handwritten C++ linked into generated code: arena, thread pool, weight loader
 bench/          Python: harness, baselines, result tables
-tests/          C++ unit and differential tests; end-to-end checks against golden logits
-third_party/    vendored single-header libraries (JSON, test framework)
+  support/      JSON reader, mmap, .npy reader
+tests/          C++ unit and differential tests; end-to-end checks against golden logits (ctest)
 docs/           log.md, notes
-build/          generated C++ and binaries (gitignored)
+build/          CMake build trees (`build/release`, `build/asan`), generated C++ and binaries (gitignored)
 ```
 
-Dependencies in the compiler stay minimal: the standard library, one JSON header, one test header. No LLVM, no MLIR.
+The compiler depends on the C++ standard library and nothing else. The JSON reader (`src/support/json.*`) and the test macros (`tests/check.h`) are our own, a few hundred lines together; vendoring a library for either would cost more in build time than it saves. No LLVM, no MLIR.
 
 ## 9. Risks and open questions
 
@@ -169,7 +171,7 @@ Dependencies in the compiler stay minimal: the standard library, one JSON header
 |---|---|
 | GEMM cannot match Accelerate on M-series | Confirmed in M0 (see section 7). Measure our kernel standalone in M4 against both Accelerate and ONNX Runtime. Report the gap; do not hide it inside a whole-model number. |
 | `torch.compile` CPU backend on macOS arm64 may be fragile | Resolved in M0: it runs and matches golden logits. |
-| Export produces ops or patterns we did not expect | M1 starts by dumping and reading the exported graph before writing any lowering. |
+| Export produces ops or patterns we did not expect | Resolved in M1: all 37 ops lower. The surprises (tied embedding transposed at run time, a mask computed from constants on every call, no-op expands, permute chains) are recorded in `docs/log.md` and are M3's work list. |
 | C++ slows iteration on pattern-matching passes | Build a small pattern-matching helper and the IR printer early, in M1. Keep debug builds fast. |
 | Fusion patterns are brittle against export changes | Pin `torch` and `transformers` versions. Pattern-match on our canonicalized IR, not raw ATen. |
 | Autotuning noise on a laptop | Min-of-N timing, re-measure the top candidates, reject results with high variance. |

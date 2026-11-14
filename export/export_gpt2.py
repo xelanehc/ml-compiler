@@ -1,13 +1,14 @@
-"""M0 exporter: prove GPT-2 goes through torch.export and save golden outputs.
+"""Exporter: take GPT-2 through torch.export, save golden outputs and the graph.
 
 For each sequence length T this script:
   1. builds the fixed input ids and runs PyTorch eager to get reference logits,
      saved under artifacts/golden/ (the oracle every later stage is tested against);
   2. runs torch.export and decomposes to core ATen ops;
   3. re-runs the exported program and checks it reproduces the eager logits;
-  4. records which operators appear, in docs/export_ops.md.
-
-Serializing the graph to JSON for the C++ compiler is M1 and is not done here.
+  4. writes the decomposed graph to artifacts/graphs/gpt2_T<T>.json and the
+     parameters to artifacts/graphs/gpt2_weights.bin for the C++ compiler
+     (the format is described in export/serialize.py);
+  5. records which operators appear, in docs/export_ops.md.
 
 Usage:  python export/export_gpt2.py
 """
@@ -20,7 +21,11 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import GOLDEN, ROOT, SEQ_LENS, golden_paths, load_model, make_input_ids
+from model import ARTIFACTS, GOLDEN, ROOT, SEQ_LENS, golden_paths, load_model, make_input_ids
+from serialize import write_graph
+
+GRAPHS = ARTIFACTS / "graphs"
+WEIGHTS = GRAPHS / "gpt2_weights.bin"
 
 
 def op_histogram(exported):
@@ -36,8 +41,10 @@ def main():
     torch.manual_seed(0)
     model = load_model()
     GOLDEN.mkdir(parents=True, exist_ok=True)
+    GRAPHS.mkdir(parents=True, exist_ok=True)
 
     histograms = {}
+    weight_table = None
     for seq_len in SEQ_LENS:
         ids_np = make_input_ids(seq_len)
         ids = torch.from_numpy(ids_np)
@@ -59,6 +66,17 @@ def main():
             replay = core.module()(ids).numpy()
         max_diff = float(np.abs(replay - logits).max())
         same_argmax = bool((replay.argmax(-1) == logits.argmax(-1)).all())
+
+        # The parameters do not depend on T, so the weights file is written
+        # once and every graph points into it. If a later T ever laid the
+        # parameters out differently, sharing the file would be wrong.
+        table = write_graph(
+            core, seq_len, GRAPHS / f"gpt2_T{seq_len}.json", WEIGHTS, write_weights_file=weight_table is None
+        )
+        if weight_table is None:
+            weight_table = table
+        elif table != weight_table:
+            raise SystemExit(f"parameter layout at T={seq_len} differs from T={SEQ_LENS[0]}")
 
         before, after = op_histogram(exported), op_histogram(core)
         histograms[seq_len] = (before, after)
@@ -100,6 +118,7 @@ def main():
     out = ROOT / "docs" / "export_ops.md"
     out.write_text("\n".join(lines))
     print(f"wrote {out.relative_to(ROOT)}")
+    print(f"wrote {GRAPHS.relative_to(ROOT)}/ ({len(SEQ_LENS)} graphs, {WEIGHTS.stat().st_size / 1e6:.0f} MB of weights)")
 
 
 if __name__ == "__main__":
