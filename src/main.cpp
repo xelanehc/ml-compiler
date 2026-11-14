@@ -1,10 +1,17 @@
 // mlc: the compiler driver.
 //
-//   mlc dump  <graph.json>     import and print the graph IR
-//   mlc stats <graph.json>     import and print node counts
-//   mlc run   <graph.json> --input ids.npy [--expect logits.npy] [--tol 1e-3] [--profile]
-//                              run the reference interpreter; with --expect,
-//                              compare against golden logits and exit 1 on mismatch
+//   mlc dump    <graph.json>     import and print the graph IR
+//   mlc stats   <graph.json>     import and print node counts
+//   mlc run     <graph.json> --input ids.npy [--expect logits.npy] [--tol 1e-3] [--profile]
+//                                run the reference interpreter on the graph
+//   mlc loops   <graph.json>     lower to the loop IR and print it
+//   mlc compile <graph.json> -o <dir> [--flags "-O3 -mcpu=native"] [--emit-only]
+//                                write <dir>/model.cpp and build <dir>/model.so
+//   mlc exec    <model.so> --weights w.bin --input ids.npy [--expect logits.npy]
+//                                [--tol 1e-3] [--runs N] [--profile]
+//                                load a compiled model and run it
+//
+// With --expect, run and exec compare against golden logits and exit 1 on mismatch.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -12,13 +19,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "codegen/codegen.h"
 #include "frontend/importer.h"
 #include "graph/interpreter.h"
 #include "graph/ir.h"
+#include "loop/ir.h"
 #include "support/files.h"
 
 using namespace mlc;
@@ -28,11 +38,48 @@ namespace {
 int usage() {
   std::fprintf(stderr,
                "usage:\n"
-               "  mlc dump  <graph.json>\n"
-               "  mlc stats <graph.json>\n"
-               "  mlc run   <graph.json> --input <ids.npy> [--expect <logits.npy>] [--tol <abs>] [--profile]\n");
+               "  mlc dump    <graph.json>\n"
+               "  mlc stats   <graph.json>\n"
+               "  mlc run     <graph.json> --input <ids.npy> [--expect <logits.npy>] [--tol <abs>] [--profile]\n"
+               "  mlc loops   <graph.json>\n"
+               "  mlc compile <graph.json> -o <dir> [--flags \"<compiler flags>\"] [--emit-only]\n"
+               "  mlc exec    <model.so> --weights <weights.bin> --input <ids.npy> [--expect <logits.npy>]\n"
+               "              [--tol <abs>] [--runs <n>] [--profile]\n");
   return 2;
 }
+
+// Command-line options after the positional argument: `--name value` pairs
+// and bare `--flag`s, looked up by name.
+struct Options {
+  std::vector<std::string> args;
+  std::vector<bool> used;
+
+  Options(int argc, char** argv) : args(argv, argv + argc), used(static_cast<size_t>(argc), false) {}
+
+  std::string value(const std::string& name, const std::string& fallback = "") {
+    for (size_t i = 0; i < args.size(); ++i) {
+      if (args[i] != name) continue;
+      if (i + 1 >= args.size()) throw std::runtime_error(name + " needs a value");
+      used[i] = used[i + 1] = true;
+      return args[i + 1];
+    }
+    return fallback;
+  }
+
+  bool flag(const std::string& name) {
+    for (size_t i = 0; i < args.size(); ++i) {
+      if (args[i] != name) continue;
+      used[i] = true;
+      return true;
+    }
+    return false;
+  }
+
+  void done() const {
+    for (size_t i = 0; i < args.size(); ++i)
+      if (!used[i]) throw std::runtime_error("unknown option " + args[i]);
+  }
+};
 
 DType dtype_of_npy(const NpyArray& a) {
   if (a.descr == "<f4") return DType::F32;
@@ -81,33 +128,17 @@ bool compare_logits(const Tensor& got, const Tensor& want, double tol) {
   return ok;
 }
 
-void print_profile(const RunStats& s, double total) {
+// Time per op kind, largest first. Shared by the graph interpreter and compiled models.
+void print_op_times(const std::vector<std::pair<std::string, std::pair<int, double>>>& rows, double total) {
   std::printf("\n%-12s %6s %10s %7s\n", "op", "calls", "seconds", "share");
-  std::vector<int> order;
-  for (int i = 0; i < kNumOps; ++i)
-    if (s.calls[i]) order.push_back(i);
-  std::sort(order.begin(), order.end(), [&](int a, int b) { return s.seconds[a] > s.seconds[b]; });
-  for (int i : order)
-    std::printf("%-12s %6d %10.4f %6.1f%%\n", op_name(static_cast<Op>(i)), s.calls[i], s.seconds[i], 100.0 * s.seconds[i] / total);
-  std::printf("\nintermediate memory: %.1f MB allocated in total, %.1f MB live at the peak\n", s.allocated_bytes / 1e6, s.peak_bytes / 1e6);
+  for (const auto& [op, stat] : rows) std::printf("%-12s %6d %10.4f %6.1f%%\n", op.c_str(), stat.first, stat.second, 100.0 * stat.second / total);
 }
 
-int run(const std::string& graph_path, int argc, char** argv) {
-  std::string input_path, expect_path;
-  double tol = 1e-3;
-  bool profile = false;
-  for (int i = 0; i < argc; ++i) {
-    std::string a = argv[i];
-    auto next = [&]() -> std::string {
-      if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
-      return argv[++i];
-    };
-    if (a == "--input") input_path = next();
-    else if (a == "--expect") expect_path = next();
-    else if (a == "--tol") tol = std::stod(next());
-    else if (a == "--profile") profile = true;
-    else throw std::runtime_error("unknown option " + a);
-  }
+int run(const std::string& graph_path, Options opts) {
+  std::string input_path = opts.value("--input"), expect_path = opts.value("--expect");
+  double tol = std::stod(opts.value("--tol", "1e-3"));
+  bool profile = opts.flag("--profile");
+  opts.done();
   if (input_path.empty()) throw std::runtime_error("run needs --input");
 
   ImportedModel model = import_graph_file(graph_path);
@@ -125,29 +156,133 @@ int run(const std::string& graph_path, int argc, char** argv) {
   double elapsed = seconds_since(t0);
   std::printf("%s: %zu nodes interpreted in %.2f s -> %s\n", std::filesystem::path(graph_path).filename().c_str(), model.graph.nodes.size(),
               elapsed, type_string(outputs.at(0).type).c_str());
-  if (profile) print_profile(stats, elapsed);
+  if (profile) {
+    std::vector<std::pair<std::string, std::pair<int, double>>> rows;
+    for (int i = 0; i < kNumOps; ++i)
+      if (stats.calls[i]) rows.push_back({op_name(static_cast<Op>(i)), {stats.calls[i], stats.seconds[i]}});
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    print_op_times(rows, elapsed);
+    std::printf("\nintermediate memory: %.1f MB allocated in total, %.1f MB live at the peak\n", stats.allocated_bytes / 1e6, stats.peak_bytes / 1e6);
+  }
 
   if (expect_path.empty()) return 0;
   NpyArray golden = read_npy(expect_path);
   return compare_logits(outputs.at(0), tensor_of_npy(golden), tol) ? 0 : 1;
 }
 
+// graph.json -> graph IR -> loop IR -> model.cpp -> model.so
+int compile(const std::string& graph_path, Options opts) {
+  std::string out_dir = opts.value("-o");
+  codegen::BuildOptions build;
+  build.flags = opts.value("--flags", build.flags);
+  bool emit_only = opts.flag("--emit-only");
+  opts.done();
+  if (out_dir.empty()) throw std::runtime_error("compile needs -o <dir>");
+
+  ImportedModel model = import_graph_file(graph_path);
+  loop::Program program = loop::lower_graph(model.graph, model.weights_bytes);
+  std::string source = codegen::emit_cpp(program);
+
+  std::filesystem::create_directories(out_dir);
+  std::string cpp_path = out_dir + "/model.cpp", so_path = out_dir + "/model.so";
+  std::ofstream(cpp_path) << source;
+  std::printf("%zu graph nodes -> %zu kernels, %zu buffers, %.1f MB arena\n", model.graph.nodes.size(), program.kernels.size(),
+              program.buffers.size(), program.arena_bytes / 1e6);
+  std::printf("wrote %s (%lld lines)\n", cpp_path.c_str(), static_cast<long long>(std::count(source.begin(), source.end(), '\n')));
+  if (emit_only) return 0;
+
+  auto t0 = std::chrono::steady_clock::now();
+  std::string command = codegen::build_shared_library(cpp_path, so_path, build);
+  std::printf("built %s in %.1f s\n  %s\n", so_path.c_str(), seconds_since(t0), command.c_str());
+  return 0;
+}
+
+int exec(const std::string& so_path, Options opts) {
+  std::string weights_path = opts.value("--weights"), input_path = opts.value("--input"), expect_path = opts.value("--expect");
+  double tol = std::stod(opts.value("--tol", "1e-3"));
+  int runs = std::stoi(opts.value("--runs", "1"));
+  bool profile = opts.flag("--profile");
+  opts.done();
+  if (input_path.empty()) throw std::runtime_error("exec needs --input");
+
+  codegen::CompiledModel model(so_path, weights_path);
+  NpyArray ids = read_npy(input_path);
+  if (model.num_inputs() != 1 || model.num_outputs() != 1) throw std::runtime_error("exec handles models with one input and one output");
+  if (static_cast<int64_t>(ids.data.size()) != model.input_bytes(0)) throw std::runtime_error("input is not the size the model was compiled for");
+
+  std::vector<std::byte> out(static_cast<size_t>(model.output_bytes(0)));
+  const void* inputs[] = {ids.data.data()};
+  void* outputs[] = {out.data()};
+
+  // The first run pays for page faults on the fresh arena and on weights not
+  // yet read from disk; it is reported separately from the rest.
+  std::vector<double> times;
+  for (int r = 0; r < std::max(runs, 1); ++r) {
+    auto t0 = std::chrono::steady_clock::now();
+    model.run(inputs, outputs);
+    times.push_back(seconds_since(t0));
+  }
+  std::printf("%s: %d kernels, %.1f MB arena, first run %.3f s", std::filesystem::path(so_path).parent_path().filename().c_str(),
+              model.num_kernels(), model.arena_bytes() / 1e6, times[0]);
+  if (times.size() > 1) {
+    std::vector<double> rest(times.begin() + 1, times.end());
+    std::sort(rest.begin(), rest.end());
+    std::printf(", then min %.3f s, median %.3f s over %zu runs", rest.front(), rest[rest.size() / 2], rest.size());
+  }
+  std::printf("\n");
+
+  if (profile) {
+    std::vector<codegen::CompiledModel::KernelTime> kernels = model.run_profiled(inputs, outputs);
+    std::vector<std::pair<std::string, std::pair<int, double>>> rows;
+    double total = 0;
+    for (const auto& k : kernels) {
+      total += k.seconds;
+      auto it = std::find_if(rows.begin(), rows.end(), [&](const auto& row) { return row.first == k.op; });
+      if (it == rows.end()) it = rows.insert(rows.end(), {k.op, {0, 0.0}});
+      ++it->second.first;
+      it->second.second += k.seconds;
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+    print_op_times(rows, total);
+    std::sort(kernels.begin(), kernels.end(), [](const auto& a, const auto& b) { return a.seconds > b.seconds; });
+    std::printf("\nslowest kernels:\n");
+    for (size_t i = 0; i < std::min<size_t>(kernels.size(), 5); ++i)
+      std::printf("  %8.4f s  %-10s %s\n", kernels[i].seconds, kernels[i].op.c_str(), kernels[i].label.c_str());
+  }
+
+  if (expect_path.empty()) return 0;
+  NpyArray golden = read_npy(expect_path);
+  if (golden.data.size() != out.size()) throw std::runtime_error("golden output is not the size the model produces");
+  return compare_logits(Tensor::borrow({dtype_of_npy(golden), golden.shape}, out.data()), tensor_of_npy(golden), tol) ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   if (argc < 3) return usage();
-  std::string command = argv[1], graph_path = argv[2];
+  std::string command = argv[1], path = argv[2];
+  Options opts(argc - 3, argv + 3);
   try {
     if (command == "dump") {
-      std::cout << print_graph(import_graph_file(graph_path).graph);
+      opts.done();
+      std::cout << print_graph(import_graph_file(path).graph);
       return 0;
     }
     if (command == "stats") {
-      ImportedModel model = import_graph_file(graph_path);
+      opts.done();
+      ImportedModel model = import_graph_file(path);
       std::printf("%d ATen nodes lowered to %s", model.aten_nodes, summarize_graph(model.graph).c_str());
       return 0;
     }
-    if (command == "run") return run(graph_path, argc - 3, argv + 3);
+    if (command == "loops") {
+      opts.done();
+      ImportedModel model = import_graph_file(path);
+      std::cout << loop::print_program(loop::lower_graph(model.graph, model.weights_bytes));
+      return 0;
+    }
+    if (command == "run") return run(path, opts);
+    if (command == "compile") return compile(path, opts);
+    if (command == "exec") return exec(path, opts);
     return usage();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "mlc: %s\n", e.what());

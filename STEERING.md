@@ -77,17 +77,21 @@ Passes, in order:
 
 ### 4.3 Loop IR
 
-- Statements: `For(var, extent, kind)`, `Store`, `Alloc`, `Block`, `Call`. Expressions: `Load`, arithmetic, intrinsic calls. `kind` is serial, parallel, or vectorized.
-- Each graph op lowers to a naive loop nest. Optimizations are explicit, composable rewrites on that nest: `split`, `tile`, `reorder`, `fuse`, `unroll`, `vectorize`, `parallelize`.
+- Statements: `For(var, extent, kind)`, `Store`, `Block`. Expressions: immediates, loop variables, `Load`, arithmetic and comparisons, `Select`, `Cast`, intrinsic calls (`exp`, `tanh`, `pow`, `sqrt`). `kind` is serial, parallel, or vectorized; only serial exists so far.
+- Accesses are multi-dimensional (`buf[i, j, k]`); flattening to one offset happens at codegen. Loop extents are constants, since shapes are static.
+- There are no scalar variables besides loop counters. Reductions accumulate through memory and temporaries are small buffers, so every dependence is a visible load or store. Promoting those to registers is M4 work.
+- A buffer is a typed, shaped view of storage: the arena, the weights file, a caller's input or output, or inline constant data. A graph `Reshape` lowers to a second view of the same storage and no code.
+- In M2 every computed value gets its own slice of the arena, never reused. The arena size is therefore the no-reuse total that M3's memory planning is measured against.
+- Each graph op lowers to a naive loop nest (`src/loop/lower.cpp`), one kernel per node. Optimizations are explicit, composable rewrites on that nest: `split`, `tile`, `reorder`, `fuse`, `unroll`, `vectorize`, `parallelize`.
 - A **schedule** is a list of those rewrites plus parameters. The autotuner searches over schedules; it never edits IR directly.
-- A loop IR interpreter (slow, tree-walking) checks that a scheduled nest still computes what the naive nest did.
+- A loop IR interpreter (slow, tree-walking, bounds-checking every index) is the reference for what a loop program means. In M2 it checks lowering against the graph interpreter on small graphs; from M4 it checks that a scheduled nest still computes what the naive nest did. It is far too slow for the full model, so the full model is checked in compiled form against the golden logits.
 
 GEMM dominates runtime (768x768, 768x3072, and the 768x50257 output projection), so it gets the most structure: cache-level tiling, operand packing, and a register-tiled micro-kernel with an unrolled FMA body. Outer loops come from the loop IR; the micro-kernel is generated from a parameterized template (`MR`, `NR`, unroll factor).
 
 ### 4.4 Codegen and runtime
 
-- Loop IR to C++ with NEON intrinsics. Vectorized loops emit a vector body plus a scalar tail.
-- The runtime linked into generated code is a few hundred lines: arena allocation, weight mmap, thread pool, timing. It is handwritten and does not grow kernels.
+- Loop IR to C++ (`mlc compile`). M2 emits scalar code only: one function per kernel, plus a table of kernels that the runtime walks. NEON intrinsics arrive in M4; vectorized loops will emit a vector body plus a scalar tail.
+- The runtime linked into generated code (`runtime/mlc_runtime.*`) is handwritten and does not grow kernels: arena allocation, weight mmap, per-kernel timing, and later the thread pool. It exposes a small C API (`mlc_open`, `mlc_run`, `mlc_run_profiled`, `mlc_close`) that Python calls through `ctypes` and `mlc exec` calls through `dlopen`.
 - Generated code is kept on disk and readable. Being able to read the output is a debugging feature.
 
 ### 4.5 Autotuner
@@ -160,7 +164,7 @@ bench/          Python: harness, baselines, result tables
   support/      JSON reader, mmap, .npy reader
 tests/          C++ unit and differential tests; end-to-end checks against golden logits (ctest)
 docs/           log.md, notes
-build/          CMake build trees (`build/release`, `build/asan`), generated C++ and binaries (gitignored)
+build/          CMake build trees (`build/release`, `build/asan`); generated C++ and libraries under `build/release/gen/` (gitignored)
 ```
 
 The compiler depends on the C++ standard library and nothing else. The JSON reader (`src/support/json.*`) and the test macros (`tests/check.h`) are our own, a few hundred lines together; vendoring a library for either would cost more in build time than it saves. No LLVM, no MLIR.

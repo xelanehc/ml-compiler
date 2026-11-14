@@ -4,7 +4,7 @@ A small ahead-of-time ML compiler that runs GPT-2 small on a CPU.
 
 It takes the real PyTorch model through `torch.export`, lowers it into its own graph IR, optimizes the graph, lowers again to a loop-level IR, applies tiling, vectorization, and multi-threading, and emits C++ with SIMD intrinsics. An autotuner picks kernel parameters by measurement. The compiler itself is written in C++, and the code it generates calls no BLAS library.
 
-**Status:** M1 complete. The exported GPT-2 graph imports into the graph IR, and the reference interpreter reproduces PyTorch's logits at every sequence length. Nothing is optimized or compiled to native code yet. See [STEERING.md](STEERING.md) for the design, milestones, and exit criteria.
+**Status:** M2 complete. GPT-2 compiles end to end: exported graph, graph IR, loop IR, generated C++, shared library, and the library reproduces PyTorch's logits at every sequence length. Nothing is optimized yet, and the result is far slower than the baselines; that is the starting line the later milestones are measured from. See [STEERING.md](STEERING.md) for the design, milestones, and exit criteria.
 
 ## Pipeline
 
@@ -31,7 +31,7 @@ A GPU backend that emits Triton kernels from the same graph IR comes last.
 |---|---|---|
 | M0 | Baselines and benchmark harness | done |
 | M1 | Frontend, graph IR, reference interpreter | done |
-| M2 | Naive end-to-end scalar codegen | not started |
+| M2 | Naive end-to-end scalar codegen | done |
 | M3 | Graph optimizations | not started |
 | M4 | Loop optimizations and SIMD kernels | not started |
 | M5 | Autotuner | not started |
@@ -42,7 +42,7 @@ A GPU backend that emits Triton kernels from the same graph IR comes last.
 
 Compared end to end against PyTorch eager, `torch.compile` on CPU, and ONNX Runtime: same machine, same inputs, fp32, batch 1, equal thread counts. Methodology is in [STEERING.md](STEERING.md#7-benchmarking-rules).
 
-Baseline numbers are in [bench/results/baselines.md](bench/results/baselines.md). Compiler results will be added here once they exist, each with the command that reproduces it.
+Baseline numbers are in [bench/results/baselines.md](bench/results/baselines.md). The compiler's unoptimized starting point is in [bench/results/mlc_m2.md](bench/results/mlc_m2.md), produced by `python bench/run.py --systems mlc --threads 1 --name mlc_m2`. A side-by-side table will be added here once the compiler is worth comparing.
 
 ## Scope
 
@@ -85,10 +85,21 @@ build/release/mlc dump artifacts/graphs/gpt2_T16.json | less
 build/release/mlc run artifacts/graphs/gpt2_T16.json \
     --input artifacts/golden/T16_ids.npy --expect artifacts/golden/T16_logits.npy --profile
 
+# Print the loop IR (what each graph node becomes as loops)
+build/release/mlc loops artifacts/graphs/gpt2_T16.json | less
+
+# Compile to C++ and a shared library, then run it against the golden logits
+build/release/mlc compile artifacts/graphs/gpt2_T16.json -o build/release/gen/gpt2_T16
+build/release/mlc exec build/release/gen/gpt2_T16/model.so --weights artifacts/graphs/gpt2_weights.bin \
+    --input artifacts/golden/T16_ids.npy --expect artifacts/golden/T16_logits.npy --runs 5 --profile
+
+# Benchmark the compiled model from Python (compiles each T first); writes bench/results/mlc_m2.md
+.venv/bin/python bench/run.py --systems mlc --threads 1 --name mlc_m2
+
 # The same tests under AddressSanitizer and UndefinedBehaviorSanitizer (slow: debug build)
 cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug -DMLC_SANITIZE=ON
 cmake --build build/asan -j
-ctest --test-dir build/asan -R "unit|golden_T16" --output-on-failure
+ctest --test-dir build/asan -R "unit|T16" --output-on-failure
 ```
 
 The first run downloads the GPT-2 weights from Hugging Face. The full benchmark takes several minutes; add `--seq-lens 16 64` for a quick pass.
@@ -97,7 +108,7 @@ The first run downloads the GPT-2 weights from Hugging Face. The full benchmark 
 
 ```
 export/       Python: torch.export -> graph.json + weights.bin
-src/          the compiler (C++): frontend, graph, support; later loop, codegen, tune, gpu
+src/          the compiler (C++): frontend, graph, loop, codegen, support; later tune, gpu
 runtime/      handwritten C++ linked into generated code: arena, thread pool, weight loader
 bench/        Python benchmark harness and baselines
 tests/

@@ -29,8 +29,16 @@ add_library(mlc_core STATIC
   src/graph/verifier.cpp
   src/graph/interpreter.cpp
   src/frontend/importer.cpp
+  src/loop/ir.cpp
+  src/loop/lower.cpp
+  src/loop/interpreter.cpp
+  src/codegen/emit_cpp.cpp
+  src/codegen/build.cpp
 )
 target_include_directories(mlc_core PUBLIC src)
+# Generated code is compiled together with the runtime; mlc needs to know where it is.
+target_compile_definitions(mlc_core PRIVATE MLC_RUNTIME_DIR="${CMAKE_SOURCE_DIR}/runtime")
+target_link_libraries(mlc_core PUBLIC ${CMAKE_DL_LIBS})
 
 add_executable(mlc src/main.cpp)
 target_link_libraries(mlc PRIVATE mlc_core)
@@ -43,20 +51,38 @@ add_executable(mlc_tests
   tests/test_ir.cpp
   tests/test_interpreter.cpp
   tests/test_importer.cpp
+  tests/test_loop.cpp
+  tests/test_codegen.cpp
 )
 target_link_libraries(mlc_tests PRIVATE mlc_core)
 target_include_directories(mlc_tests PRIVATE tests)
 add_test(NAME unit COMMAND mlc_tests)
 
-# End-to-end: interpret the real exported GPT-2 and compare with PyTorch's
-# golden logits. Needs `python export/export_gpt2.py` to have been run. The
-# two long sequence lengths are labelled "slow" (ctest -LE slow skips them).
+# End-to-end, against PyTorch's golden logits. Needs `python export/export_gpt2.py`
+# to have been run. For each sequence length:
+#   golden_T<T>    the graph interpreter on the imported graph
+#   compile_T<T>   graph -> loop IR -> C++ -> shared library
+#   compiled_T<T>  the shared library, run on the golden input
+# The two long sequence lengths are labelled "slow" (ctest -LE slow skips them).
 set(ARTIFACTS ${CMAKE_SOURCE_DIR}/artifacts)
+set(GEN ${CMAKE_BINARY_DIR}/gen)
+# In the sanitizer configuration the generated code is sanitized too.
+if(MLC_SANITIZE)
+  set(GEN_FLAGS "-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer")
+else()
+  set(GEN_FLAGS "-O3 -mcpu=native")
+endif()
 foreach(T 16 64 256 1024)
-  add_test(NAME golden_T${T}
-    COMMAND mlc run ${ARTIFACTS}/graphs/gpt2_T${T}.json
-            --input ${ARTIFACTS}/golden/T${T}_ids.npy
-            --expect ${ARTIFACTS}/golden/T${T}_logits.npy)
-  set_tests_properties(golden_T${T} PROPERTIES REQUIRED_FILES ${ARTIFACTS}/graphs/gpt2_T${T}.json)
+  set(GRAPH ${ARTIFACTS}/graphs/gpt2_T${T}.json)
+  set(GOLDEN --input ${ARTIFACTS}/golden/T${T}_ids.npy --expect ${ARTIFACTS}/golden/T${T}_logits.npy)
+  add_test(NAME golden_T${T} COMMAND mlc run ${GRAPH} ${GOLDEN})
+  add_test(NAME compile_T${T} COMMAND mlc compile ${GRAPH} -o ${GEN}/gpt2_T${T} --flags ${GEN_FLAGS})
+  add_test(NAME compiled_T${T}
+    COMMAND mlc exec ${GEN}/gpt2_T${T}/model.so --weights ${ARTIFACTS}/graphs/gpt2_weights.bin ${GOLDEN})
+  set_tests_properties(golden_T${T} compile_T${T} compiled_T${T} PROPERTIES REQUIRED_FILES ${GRAPH})
+  # A fixture makes ctest build the library before running it, and skip the run if the build failed.
+  set_tests_properties(compile_T${T} PROPERTIES FIXTURES_SETUP lib_T${T})
+  set_tests_properties(compiled_T${T} PROPERTIES FIXTURES_REQUIRED lib_T${T})
 endforeach()
-set_tests_properties(golden_T256 golden_T1024 PROPERTIES LABELS slow TIMEOUT 1800)
+set_tests_properties(golden_T256 golden_T1024 compile_T256 compile_T1024 compiled_T256 compiled_T1024
+  PROPERTIES LABELS slow TIMEOUT 1800)

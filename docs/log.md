@@ -74,3 +74,44 @@ Reproduce: `ctest --test-dir build/release --output-on-failure`, or `build/relea
 **Open**
 
 - Baseline and interpreter timings above were taken on battery. Rerun on AC before quoting them.
+
+## M2: naive end to end (2026-11-12)
+
+**Built**
+
+- `src/loop/ir.*`: the loop IR. Three statements (`For`, `Store`, `Block`), expressions with multi-dimensional `Load`, buffers as typed views of storage (arena, weights, input, output, inline). A printer (`mlc loops`) and a verifier.
+- `src/loop/lower.cpp`: every graph op to a naive loop nest, one kernel per node. Each computed value gets its own arena slice; `Reshape` becomes a second view of the same bytes and no code.
+- `src/loop/interpreter.cpp`: tree-walking reference interpreter for loop programs, bounds-checking every index on every axis.
+- `src/codegen/emit_cpp.cpp`: loop IR to scalar C++17, one function per kernel plus a kernel table.
+- `src/codegen/build.cpp`: runs `clang++ -O3 -mcpu=native -shared`, and loads the result with `dlopen`.
+- `runtime/mlc_runtime.*`: maps the weights, allocates the arena, walks the kernel table, times kernels. C API for `ctypes`.
+- `mlc loops | compile | exec`; `bench/worker.py` gained the `mlc` system.
+- 18 new unit tests (58 total): every op's lowering checked differentially against the graph interpreter, a toy transformer through graph interpreter, loop interpreter, and compiled code, verifier negatives. `ctest` now compiles and runs the real model per `T`. In the sanitizer configuration the generated code is built with ASan + UBSan as well.
+
+**Numbers** (AC power, one thread)
+
+| T | max abs logit diff vs PyTorch | argmax mismatches | compiled, median | graph interpreter (M1) | PyTorch eager, 1 thread (M0, on battery) | arena |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 | 1.4e-04 | 0 | 0.65 s | 0.41 s | 0.038 s | 192 MB |
+| 64 | 1.2e-04 | 0 | 2.32 s | 1.00 s | 0.109 s | 315 MB |
+| 256 | 2.1e-04 | 0 | 8.97 s | 3.54 s | 0.458 s | 983 MB |
+| 1024 | 1.8e-04 | 0 | 38.1 s | 16.3 s | 1.12 s | 6453 MB |
+
+This is the "unoptimized" row. Compiled times are from `python bench/run.py --systems mlc --threads 1 --name mlc_m2` (`bench/results/mlc_m2.md`); T=256 has 14 timed runs and T=1024 has 4, because of the harness's 120 s cap for slow systems. Interpreter times are single runs of `mlc run` on the same power state. The PyTorch column was measured on battery and is not directly comparable until M0 is rerun on AC.
+
+1062 graph nodes become 541 kernels and 8626 lines of C++; `clang++` takes 10 to 17 s per sequence length.
+
+Profile at T=1024 (`mlc exec ... --profile`, one run): `gemm` 30.5 s (77.5%), `matmul` 6.3 s (16.1%), `softmax` 0.9 s, everything else under 0.3 s each. The final `mm` alone is 5.0 s.
+
+**Surprises**
+
+- The compiled model is 1.6 to 2.5 times slower than the interpreter it was derived from. Both use the same `i, p, j` matmul loop. In the interpreter that loop is handwritten C++ with `A[i][p]` held in a local; in generated code every operand is a load through a pointer computed from `arena`. clang's vectorizer reports "loop not vectorized: unsafe dependent memory operations" for all 48 `gemm` kernels: it cannot prove the store to `C` leaves `A` unchanged, because both are offsets into the same arena. So `gemm` runs scalar and reloads `A[i][p]` on every iteration.
+- The final `mm` is the same loop and *is* vectorized (width 4, interleave 4). Its output is the caller's pointer, not the arena, and clang is willing to guard that with a run-time overlap check. Per multiply-add it runs nearly three times faster than `gemm`. The only difference is where the buffers live.
+- So the compiler knows something clang does not: its buffers never overlap. Telling clang (`restrict`, or loading invariants into locals) is the cheapest speedup available and belongs in M4, measured.
+- The first call at T=1024 took 82 s against 38 to 41 s afterwards: 6.4 GB of fresh arena is 400 thousand page faults. Without memory reuse the arena is as large as every intermediate added together.
+- The non-GEMM overhead that hurt the interpreter mostly disappeared: `where` + `broadcast` went from 1.7 s to 0.37 s at T=1024, because a broadcast is now a missing loop variable rather than an odometer.
+- All four sequence lengths matched PyTorch on the first compiled run.
+
+**Open**
+
+- Rerun the M0 baselines on AC so the tables share a power state.

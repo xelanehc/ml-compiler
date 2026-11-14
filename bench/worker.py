@@ -9,9 +9,11 @@ Prints one JSON object on the last line of stdout.
 """
 
 import argparse
+import ctypes
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -25,18 +27,28 @@ MIN_SECONDS = 2.0  # fast configs keep sampling until this much time is measured
 MAX_RUNS = 500
 
 
-def time_it(fn):
+def time_it(fn, budget_seconds=0.0):
     """Return per-call wall times in milliseconds.
 
     Warmup calls are discarded: the first few calls pay for one-time work
     (lazy allocation, page faults on fresh memory, thread pool startup, cold
     caches) that is not part of steady-state inference.
+
+    A nonzero budget_seconds caps the time spent on a slow system: warmup stops
+    once a fifth of the budget is gone, and sampling stops once the budget is
+    spent, as long as at least three samples exist. The result then has fewer
+    than MIN_RUNS samples, and the "runs" field says how many.
     """
-    for _ in range(WARMUP_RUNS):
+    start_all = time.perf_counter()
+    for i in range(WARMUP_RUNS):
         fn()
+        if budget_seconds and time.perf_counter() - start_all > budget_seconds / 5:
+            break
     samples = []
     total = 0.0
     while len(samples) < MIN_RUNS or (total < MIN_SECONDS and len(samples) < MAX_RUNS):
+        if budget_seconds and len(samples) >= 3 and total > budget_seconds:
+            break
         start = time.perf_counter_ns()
         fn()
         elapsed = (time.perf_counter_ns() - start) / 1e6
@@ -99,7 +111,51 @@ def build_ort(model, ids_np, threads):
     return run, lambda out: out[0]
 
 
-BUILDERS = {"eager": build_eager, "compile": build_compile, "ort": build_ort}
+def build_mlc(model, ids_np, threads):
+    """Our compiler: build the shared library for this T, then call it through ctypes.
+
+    The library is rebuilt every time, so the numbers always describe the
+    compiler as it is now. The build is not part of the timing.
+    """
+    import numpy as np
+
+    seq_len = ids_np.shape[1]
+    mlc = ROOT / "build" / "release" / "mlc"
+    if not mlc.exists():
+        raise SystemExit("build/release/mlc not found: build the compiler first (see README)")
+    graphs = ROOT / "artifacts" / "graphs"
+    out_dir = ROOT / "build" / "release" / "gen" / f"gpt2_T{seq_len}"
+    subprocess.run(
+        [str(mlc), "compile", str(graphs / f"gpt2_T{seq_len}.json"), "-o", str(out_dir)],
+        check=True, stdout=subprocess.DEVNULL,
+    )
+
+    lib = ctypes.CDLL(str(out_dir / "model.so"))
+    lib.mlc_open.argtypes = [ctypes.c_char_p]
+    lib.mlc_last_error.restype = ctypes.c_char_p
+    if lib.mlc_open(str(graphs / "gpt2_weights.bin").encode()) != 0:
+        raise SystemExit(f"mlc_open failed: {lib.mlc_last_error().decode()}")
+
+    # mlc_run takes an array of input pointers and an array of output
+    # pointers. The arrays are built once; each call then just runs the model,
+    # writing logits straight into `logits`.
+    ids = np.ascontiguousarray(ids_np, dtype=np.int64)
+    logits = np.empty((1, seq_len, 50257), dtype=np.float32)
+    lib.mlc_output_bytes.restype = ctypes.c_int64
+    assert lib.mlc_output_bytes(0) == logits.nbytes
+    inputs = (ctypes.c_void_p * 1)(ids.ctypes.data)
+    outputs = (ctypes.c_void_p * 1)(logits.ctypes.data)
+    lib.mlc_run.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+    lib.mlc_run.restype = None
+
+    def run():
+        lib.mlc_run(inputs, outputs)
+        return logits
+
+    return run, lambda out: out
+
+
+BUILDERS = {"eager": build_eager, "compile": build_compile, "ort": build_ort, "mlc": build_mlc}
 
 
 def main():
@@ -107,6 +163,8 @@ def main():
     parser.add_argument("--system", choices=BUILDERS, required=True)
     parser.add_argument("--threads", type=int, required=True)
     parser.add_argument("--seq-lens", type=int, nargs="+", required=True)
+    parser.add_argument("--budget-seconds", type=float, default=0.0,
+                        help="cap on measuring time per sequence length; 0 means no cap")
     args = parser.parse_args()
 
     # Must be set before torch is imported: OpenMP reads it once at startup.
@@ -131,7 +189,7 @@ def main():
         max_diff = float(np.abs(logits - golden).max())
         argmax_match = bool((logits.argmax(-1) == golden.argmax(-1)).all())
 
-        samples = time_it(run)
+        samples = time_it(run, args.budget_seconds)
         results.append(
             {
                 "system": args.system,
