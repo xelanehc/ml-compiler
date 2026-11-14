@@ -174,7 +174,7 @@ Each milestone ends with a short entry in `docs/log.md`: what was built, the num
 - **ONNX Runtime is the peer.** Same class of hardware path as our generated code. Target: beat it at every `T`, at 1 and 4 threads.
 - **PyTorch on Accelerate is the ceiling on GEMM.** We do not expect to match its matrix multiply. At small `T` it is beatable, because ONNX Runtime already beats it at `T=16` with 4 threads. At large `T` even PyTorch spends most of its time outside GEMM (its whole-model rate is far below its GEMM rate), so fused attention, softmax, and GELU are where we can close distance.
 
-**Setting expectations.** The realistic places to win are per-op overhead, fusion, memory reuse, and shape specialization, which matter most at small `T`. At large `T` the result is decided by GEMM throughput, where the baselines sit on a vendor-tuned library. We set the numeric target after M0 measures the baselines, and we report losses as plainly as wins, with the per-op breakdown that explains them. If an x86 Linux machine is available, repeating the comparison there (AVX2 against MKL or OpenBLAS) is a fairer kernel-to-kernel contest and is worth doing.
+**Outcome (M6, AC power).** Against ONNX Runtime we are level at `T=1024` on one and four threads, 1 to 6% behind at shorter lengths on one thread, and 12 to 57% behind on four. The target of beating it everywhere was not met. Matrix products are 96 to 98% of every run, so the predicted wins from per-op overhead and fusion had nothing to act on; the result was decided by the GEMM kernel and by memory traffic at small `T`. PyTorch on Accelerate is 1.6 to 4.5 times faster than us on one thread, as expected. `docs/writeup.md` has the tables and the explanation.
 
 ## 8. Repository layout
 
@@ -193,7 +193,7 @@ tuning/         cache.json: schedules measured by `mlc tune` on the development 
 bench/          Python: harness, baselines, result tables
   support/      JSON reader, mmap, .npy reader
 tests/          C++ unit and differential tests; end-to-end checks against golden logits (ctest)
-docs/           log.md, notes
+docs/           writeup.md (results), log.md (history), export_ops.md
 build/          CMake build trees (`build/release`, `build/asan`); generated C++ and libraries under `build/release/gen/` (gitignored)
 ```
 
@@ -206,7 +206,8 @@ The compiler depends on the C++ standard library and nothing else. The JSON read
 | The output projection's weight is transposed at run time | Resolved in M4 (`layout`, section 4.2). |
 | GEMM cannot match Accelerate on M-series | Confirmed in M0 and measured in M4 (`bench/results/gemm_T*.md`): Accelerate is several times faster than any NEON kernel on large products. We report the gap. |
 | Transposed weights double the weights' memory | Open. 340 MB of persistent memory holds transposed copies of the 48 dense-layer weights. The originals stay in the mapped file and can be paged out, but the address space and load time (about 0.1 s) are paid. Alternatives for M5: store the weights transposed in the weights file, or transpose per call in cache-sized blocks. |
-| Numbers so far were taken on battery in Low Power Mode | Open. All of M4's tables are internally consistent but about half speed, and sustained four-thread runs at `T=1024` are throttled. Re-measure on AC before M6. |
+| Numbers so far were taken on battery in Low Power Mode | Resolved in M6: every table the writeup uses was re-measured on AC. The kernel comparison with ONNX Runtime reversed when it was. |
+| Small `T` on four threads is far behind ONNX Runtime | Open. The dense layers are limited by reading cold weights; cause of the difference not found. See `docs/writeup.md`. |
 | `torch.compile` CPU backend on macOS arm64 may be fragile | Resolved in M0: it runs and matches golden logits. |
 | Export produces ops or patterns we did not expect | Resolved in M1: all 37 ops lower. The surprises (tied embedding transposed at run time, a mask computed from constants on every call, no-op expands, permute chains) are recorded in `docs/log.md` and are M3's work list. |
 | C++ slows iteration on pattern-matching passes | Build a small pattern-matching helper and the IR printer early, in M1. Keep debug builds fast. |

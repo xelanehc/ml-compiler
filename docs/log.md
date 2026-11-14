@@ -332,3 +332,29 @@ The thread threshold (`--tune-threshold`, T=64, four threads) kept the default 6
 - Re-run `bench/run.py`, `bench/gemm.py`, and `bench/ablate.py` on AC so M4's tables match this session's power state.
 - Sanitizer build for M5.
 
+## M6: final CPU benchmark and writeup (2026-11-14)
+
+**Built**
+
+- `bench/per_op.py`: time per kind of operation at every `T`, from `mlc exec --profile`, which now takes each kernel's best time over all runs instead of one run's.
+- `docs/writeup.md`: the comparison, the per-op breakdown, the matrix product alone, both ablations, and what they mean.
+- Every result table re-measured in one afternoon on AC with Low Power Mode off: `final.md`, `gemm_T16.md`, `gemm_T1024.md`, `per_op.md`, `per_op_tuned.md`, `m4_ablation_*.md`, `m3_ablation_cumulative.md`, `m3_ablation_T1024.md`.
+- Checked: 103 unit tests in release and under ASan + UBSan; sanitized end-to-end runs at T=16; the full release `ctest`, including T=256 and T=1024, before the last two source changes (the profiling minimum and a warning fix in `lower.cpp`), after which the unit tests and the benchmark's own golden checks at every `T` passed.
+
+**Numbers**
+
+In `docs/writeup.md`. The headline: against ONNX Runtime, level at T=1024 on one and four threads; 1 to 6% behind below that on one thread; 12, 40, and 57% behind at T=256, 64, and 16 on four.
+
+**Surprises**
+
+- The kernel comparison reversed with the power state. In Low Power Mode our matrix products alone beat ONNX Runtime's at T=1024 (56.9 against 50.0 GFLOP/s). On AC it wins, 103.1 against 94.8. A slower clock hides memory and load-port effects, and a result from a throttled machine does not carry over.
+- M5's note that the small-`T` gap "is no longer in the matrix products" was wrong. The per-op table shows they are 97% of the four-thread run at T=16. What is different in the model is that the weights are cold: 494 MB read once per call. Alone, at 370 GFLOP/s, the dense layers would take 7 ms; in the model they take 10.5.
+- Software prefetch for that case, tried in a hand-written copy of the kernel over 48 cold matrices, was 15 to 30% slower on one thread and 13 to 30% slower on four. Not added.
+- `bench/profile.py`, as the per-op script was first called, shadowed Python's `profile` module and made `bench/run.py` fail inside `torch`. The first full benchmark run silently produced no table because the log was filtered. Renamed to `per_op.py`.
+- Graph passes still buy no measurable speed after M4. M3's log said to re-check once matrix products stopped hiding everything else; they never did.
+
+**Open, if the CPU side is taken further**
+
+- The four items at the end of `docs/writeup.md`.
+- M7 (Triton backend) needs a Linux machine with an NVIDIA GPU, which this project does not have yet.
+

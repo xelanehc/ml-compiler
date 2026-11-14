@@ -386,7 +386,11 @@ class Lowerer {
     std::string label = "%" + std::to_string(v);
     if (!n.name.empty()) label += " " + n.name;
     std::vector<Kernel>& list = at_load(v) ? p_.init_kernels : p_.kernels;
-    list.push_back(Kernel{op_name(n.op), std::move(label), std::move(body)});
+    Kernel kernel;
+    kernel.op = op_name(n.op);
+    kernel.label = std::move(label);
+    kernel.body = std::move(body);
+    list.push_back(std::move(kernel));
     return list.back();
   }
 
@@ -702,7 +706,11 @@ class Lowerer {
       BufferId out = new_buffer("out" + std::to_string(k), type, Storage::Output, 0, k);
       next_var_ = 0;
       StmtPtr body = nest(type.shape, [&](const Idx& idx) { return make_store(out, idx, read(v, idx)); });
-      p_.kernels.push_back(Kernel{"copy", "output " + std::to_string(k), std::move(body)});
+      Kernel copy;
+      copy.op = "copy";
+      copy.label = "output " + std::to_string(k);
+      copy.body = std::move(body);
+      p_.kernels.push_back(std::move(copy));
     }
   }
 };

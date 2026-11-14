@@ -2,52 +2,52 @@
 
 GPT-2 small, full forward pass, one thread unless the row says otherwise (4 for leave-one-out), compiled with `clang++ -O3 -mcpu=native`.
 Every build was checked against the golden logits before it was timed.
-Measured on battery power with Low Power Mode on (about half the normal single-core speed). Times are the minimum over the timed runs, with the median in parentheses;
+Measured on AC power. Times are the minimum over the timed runs, with the median in parentheses;
 the first run of each build (page faults on a fresh arena) is listed separately.
 
 ## T=16 (10 timed runs per build)
 
 | optimizations | nodes | kernels | arena MB | persistent MB | first run s | time s | vs first row |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| graph passes only (M3) | 615 | 258 | 154.4 | 0.0 | 1.563 | 1.050 (1.151) | 1.00x |
-| + noalias | 615 | 258 | 154.4 | 0.0 | 1.103 | 1.047 (1.075) | 1.00x |
-| + vectorize | 615 | 258 | 154.4 | 0.0 | 0.494 | 0.433 (0.442) | 2.42x |
-| + vmath | 615 | 258 | 154.4 | 0.0 | 0.487 | 0.434 (0.438) | 2.42x |
-| + layout | 686 | 329 | 11.9 | 0.0 | 0.393 | 0.356 (0.362) | 2.95x |
-| + hoist | 686 | 280 | 0.3 | 339.8 | 0.269 | 0.247 (0.248) | 4.25x |
-| + regtile | 686 | 280 | 0.3 | 339.8 | 0.092 | 0.075 (0.078) | 14.00x |
-| + cachetile | 686 | 280 | 0.3 | 339.8 | 0.094 | 0.075 (0.078) | 14.00x |
-| + parallel, 1 thread | 686 | 280 | 0.3 | 339.8 | 0.092 | 0.075 (0.076) | 14.00x |
-| + parallel, 4 threads | 686 | 280 | 0.3 | 339.8 | 0.034 | 0.027 (0.070) | 38.89x |
+| graph passes only (M3) | 615 | 258 | 154.4 | 0.0 | 0.685 | 0.638 (0.651) | 1.00x |
+| + noalias | 615 | 258 | 154.4 | 0.0 | 0.698 | 0.653 (0.687) | 0.98x |
+| + vectorize | 615 | 258 | 154.4 | 0.0 | 0.358 | 0.280 (0.290) | 2.28x |
+| + vmath | 615 | 258 | 154.4 | 0.0 | 0.341 | 0.281 (0.292) | 2.27x |
+| + layout | 686 | 329 | 11.9 | 0.0 | 0.242 | 0.211 (0.219) | 3.02x |
+| + hoist | 686 | 280 | 0.3 | 339.8 | 0.159 | 0.145 (0.153) | 4.38x |
+| + regtile | 686 | 280 | 0.3 | 339.8 | 0.063 | 0.046 (0.047) | 13.84x |
+| + cachetile | 686 | 280 | 0.3 | 339.8 | 0.060 | 0.046 (0.046) | 13.84x |
+| + parallel, 1 thread | 686 | 280 | 0.3 | 339.8 | 0.064 | 0.046 (0.049) | 13.90x |
+| + parallel, 4 threads | 686 | 280 | 0.3 | 339.8 | 0.024 | 0.020 (0.040) | 31.57x |
 
 ## T=64 (6 timed runs per build)
 
 | optimizations | nodes | kernels | arena MB | persistent MB | first run s | time s | vs first row |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| graph passes only (M3) | 615 | 258 | 154.6 | 0.0 | 3.997 | 3.876 (3.918) | 1.00x |
-| + noalias | 615 | 258 | 154.6 | 0.0 | 3.984 | 3.884 (3.904) | 1.00x |
-| + vectorize | 615 | 258 | 154.6 | 0.0 | 1.504 | 1.435 (1.447) | 2.70x |
-| + vmath | 615 | 258 | 154.6 | 0.0 | 1.485 | 1.406 (1.412) | 2.76x |
-| + layout | 686 | 329 | 12.4 | 0.0 | 1.165 | 1.111 (1.117) | 3.49x |
-| + hoist | 686 | 280 | 1.4 | 339.9 | 1.017 | 0.996 (0.998) | 3.89x |
-| + regtile | 686 | 280 | 1.4 | 339.9 | 0.318 | 0.296 (0.305) | 13.09x |
-| + cachetile | 686 | 280 | 1.4 | 339.9 | 0.309 | 0.292 (0.295) | 13.27x |
-| + parallel, 1 thread | 686 | 280 | 1.4 | 339.9 | 0.308 | 0.294 (0.298) | 13.18x |
-| + parallel, 4 threads | 686 | 280 | 1.4 | 339.9 | 0.190 | 0.086 (0.104) | 45.07x |
+| graph passes only (M3) | 615 | 258 | 154.6 | 0.0 | 2.407 | 2.310 (2.315) | 1.00x |
+| + noalias | 615 | 258 | 154.6 | 0.0 | 2.336 | 2.309 (2.320) | 1.00x |
+| + vectorize | 615 | 258 | 154.6 | 0.0 | 0.919 | 0.872 (0.879) | 2.65x |
+| + vmath | 615 | 258 | 154.6 | 0.0 | 0.893 | 0.863 (0.874) | 2.68x |
+| + layout | 686 | 329 | 12.4 | 0.0 | 0.692 | 0.658 (0.665) | 3.51x |
+| + hoist | 686 | 280 | 1.4 | 339.9 | 0.626 | 0.586 (0.594) | 3.95x |
+| + regtile | 686 | 280 | 1.4 | 339.9 | 0.190 | 0.175 (0.182) | 13.18x |
+| + cachetile | 686 | 280 | 1.4 | 339.9 | 0.193 | 0.174 (0.181) | 13.31x |
+| + parallel, 1 thread | 686 | 280 | 1.4 | 339.9 | 0.194 | 0.173 (0.177) | 13.32x |
+| + parallel, 4 threads | 686 | 280 | 1.4 | 339.9 | 0.062 | 0.058 (0.112) | 39.90x |
 
 ## T=256 (4 timed runs per build)
 
 | optimizations | nodes | kernels | arena MB | persistent MB | first run s | time s | vs first row |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| graph passes only (M3) | 615 | 258 | 155.2 | 0.0 | 15.954 | 15.719 (16.843) | 1.00x |
-| + noalias | 615 | 258 | 155.2 | 0.0 | 15.708 | 15.656 (15.676) | 1.00x |
-| + vectorize | 615 | 258 | 155.2 | 0.0 | 5.598 | 5.552 (5.560) | 2.83x |
-| + vmath | 615 | 258 | 155.2 | 0.0 | 5.503 | 5.608 (6.259) | 2.80x |
-| + layout | 686 | 329 | 14.2 | 0.0 | 4.219 | 4.183 (4.186) | 3.76x |
-| + hoist | 686 | 280 | 8.7 | 340.5 | 4.296 | 4.106 (4.194) | 3.83x |
-| + regtile | 686 | 280 | 8.7 | 340.5 | 1.257 | 1.221 (1.230) | 12.87x |
-| + cachetile | 686 | 280 | 8.7 | 340.5 | 1.210 | 1.178 (1.182) | 13.34x |
-| + parallel, 1 thread | 686 | 280 | 8.7 | 340.5 | 1.226 | 1.185 (1.202) | 13.26x |
-| + parallel, 4 threads | 686 | 280 | 8.7 | 340.5 | 0.467 | 0.345 (0.444) | 45.56x |
+| graph passes only (M3) | 615 | 258 | 155.2 | 0.0 | 9.254 | 9.209 (9.236) | 1.00x |
+| + noalias | 615 | 258 | 155.2 | 0.0 | 9.321 | 9.198 (9.245) | 1.00x |
+| + vectorize | 615 | 258 | 155.2 | 0.0 | 3.331 | 3.297 (3.320) | 2.79x |
+| + vmath | 615 | 258 | 155.2 | 0.0 | 3.957 | 3.396 (3.514) | 2.71x |
+| + layout | 686 | 329 | 14.2 | 0.0 | 2.523 | 2.495 (2.535) | 3.69x |
+| + hoist | 686 | 280 | 8.7 | 340.5 | 2.490 | 2.427 (2.434) | 3.79x |
+| + regtile | 686 | 280 | 8.7 | 340.5 | 0.741 | 0.711 (0.726) | 12.96x |
+| + cachetile | 686 | 280 | 8.7 | 340.5 | 0.720 | 0.688 (0.708) | 13.39x |
+| + parallel, 1 thread | 686 | 280 | 8.7 | 340.5 | 0.729 | 0.689 (0.700) | 13.38x |
+| + parallel, 4 threads | 686 | 280 | 8.7 | 340.5 | 0.250 | 0.212 (0.246) | 43.40x |
 
 Reproduce with `python bench/ablate.py --stage m4 --mode cumulative --seq-lens 16 64 256`.

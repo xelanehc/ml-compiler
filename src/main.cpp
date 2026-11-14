@@ -221,7 +221,7 @@ bool compare_logits(const Tensor& got, const Tensor& want, double tol) {
 // Time per op kind, largest first. Shared by the graph interpreter and compiled models.
 void print_op_times(const std::vector<std::pair<std::string, std::pair<int, double>>>& rows, double total) {
   std::printf("\n%-12s %6s %10s %7s\n", "op", "calls", "seconds", "share");
-  for (const auto& [op, stat] : rows) std::printf("%-12s %6d %10.4f %6.1f%%\n", op.c_str(), stat.first, stat.second, 100.0 * stat.second / total);
+  for (const auto& [op, stat] : rows) std::printf("%-12s %6d %10.6f %6.1f%%\n", op.c_str(), stat.first, stat.second, 100.0 * stat.second / total);
 }
 
 int run(const std::string& graph_path, Options opts) {
@@ -327,12 +327,18 @@ int exec(const std::string& so_path, Options opts) {
   if (times.size() > 1) {
     std::vector<double> rest(times.begin() + 1, times.end());
     std::sort(rest.begin(), rest.end());
-    std::printf(", then min %.3f s, median %.3f s over %zu runs", rest.front(), rest[rest.size() / 2], rest.size());
+    std::printf(", then min %.4f s, median %.4f s over %zu runs", rest.front(), rest[rest.size() / 2], rest.size());
   }
   std::printf("\n");
 
   if (profile) {
+    // Each kernel's best time over as many profiled runs as there were timed
+    // runs: a single run is too noisy to compare small ops.
     std::vector<codegen::CompiledModel::KernelTime> kernels = model.run_profiled(inputs, outputs);
+    for (int r = 1; r < runs; ++r) {
+      std::vector<codegen::CompiledModel::KernelTime> again = model.run_profiled(inputs, outputs);
+      for (size_t k = 0; k < kernels.size(); ++k) kernels[k].seconds = std::min(kernels[k].seconds, again[k].seconds);
+    }
     std::vector<std::pair<std::string, std::pair<int, double>>> rows;
     double total = 0;
     for (const auto& k : kernels) {
