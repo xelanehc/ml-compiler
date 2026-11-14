@@ -111,7 +111,7 @@ def build_ort(model, ids_np, threads):
     return run, lambda out: out[0]
 
 
-def build_mlc(model, ids_np, threads):
+def build_mlc(model, ids_np, threads, tuning=None):
     """Our compiler: build the shared library for this T, then call it through ctypes.
 
     The library is rebuilt every time, so the numbers always describe the
@@ -124,11 +124,12 @@ def build_mlc(model, ids_np, threads):
     if not mlc.exists():
         raise SystemExit("build/release/mlc not found: build the compiler first (see README)")
     graphs = ROOT / "artifacts" / "graphs"
-    out_dir = ROOT / "build" / "release" / "gen" / f"gpt2_T{seq_len}"
-    subprocess.run(
-        [str(mlc), "compile", str(graphs / f"gpt2_T{seq_len}.json"), "-o", str(out_dir)],
-        check=True, stdout=subprocess.DEVNULL,
-    )
+    out_dir = ROOT / "build" / "release" / "gen" / (f"gpt2_T{seq_len}" + ("_tuned" if tuning else ""))
+    command = [str(mlc), "compile", str(graphs / f"gpt2_T{seq_len}.json"), "-o", str(out_dir)]
+    if tuning:
+        # Schedules measured by `mlc tune` for this thread count.
+        command += ["--tuning", str(tuning), "--tuned-threads", str(threads)]
+    subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
 
     lib = ctypes.CDLL(str(out_dir / "model.so"))
     lib.mlc_open.argtypes = [ctypes.c_char_p]
@@ -156,7 +157,15 @@ def build_mlc(model, ids_np, threads):
     return run, lambda out: out
 
 
-BUILDERS = {"eager": build_eager, "compile": build_compile, "ort": build_ort, "mlc": build_mlc}
+def build_mlc_tuned(model, ids_np, threads):
+    """Our compiler, with the autotuner's cache (tuning/cache.json)."""
+    cache = ROOT / "tuning" / "cache.json"
+    if not cache.exists():
+        raise SystemExit("tuning/cache.json not found: run `mlc tune` first (see README)")
+    return build_mlc(model, ids_np, threads, tuning=cache)
+
+
+BUILDERS = {"eager": build_eager, "compile": build_compile, "ort": build_ort, "mlc": build_mlc, "mlc-tuned": build_mlc_tuned}
 
 
 def main():
@@ -206,7 +215,7 @@ def main():
             }
         )
         print(
-            f"  {args.system:8s} threads={args.threads} T={seq_len:5d}  "
+            f"  {args.system:9s} threads={args.threads} T={seq_len:5d}  "
             f"median {statistics.median(samples):9.2f} ms  min {min(samples):9.2f} ms  "
             f"({len(samples)} runs, max|diff| {max_diff:.1e})",
             file=sys.stderr,

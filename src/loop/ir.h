@@ -162,6 +162,11 @@ struct Kernel {
   // variables of i, j, and p, so a schedule can name them. -1 where the axis
   // has size 1 and so no loop, and in every other kind of kernel.
   VarId mm_i = -1, mm_j = -1, mm_p = -1;
+  // What the kernel computes, shapes included, e.g. "gemm [16,768] x [2304,768]^T".
+  // Two kernels with the same signature are the same loops over different
+  // memory, so a schedule measured for one is valid for the other. Set for
+  // dot-form matrix products only.
+  std::string signature;
 };
 
 struct Program {

@@ -36,6 +36,7 @@ add_library(mlc_core STATIC
   src/loop/interpreter.cpp
   src/codegen/emit_cpp.cpp
   src/codegen/build.cpp
+  src/tune/tuner.cpp
 )
 target_include_directories(mlc_core PUBLIC src)
 # Generated code is compiled together with the runtime; mlc needs to know where it is.
@@ -57,6 +58,7 @@ add_executable(mlc_tests
   tests/test_codegen.cpp
   tests/test_passes.cpp
   tests/test_schedule.cpp
+  tests/test_tune.cpp
 )
 target_link_libraries(mlc_tests PRIVATE mlc_core)
 target_include_directories(mlc_tests PRIVATE tests)
@@ -98,6 +100,17 @@ add_test(NAME compiled_T16_one_thread
   COMMAND mlc exec ${GEN}/gpt2_T16/model.so --weights ${ARTIFACTS}/graphs/gpt2_weights.bin --threads 1
           --input ${ARTIFACTS}/golden/T16_ids.npy --expect ${ARTIFACTS}/golden/T16_logits.npy)
 set_tests_properties(compiled_T16_one_thread PROPERTIES FIXTURES_REQUIRED lib_T16)
+
+# The build made from the autotuner's cache (tuning/cache.json), if there is one.
+# The cache only changes schedules, so the logits must still match.
+add_test(NAME compile_tuned_T16
+  COMMAND mlc compile ${ARTIFACTS}/graphs/gpt2_T16.json -o ${GEN}/gpt2_T16_tuned --tuning ${CMAKE_SOURCE_DIR}/tuning/cache.json --flags ${GEN_FLAGS})
+add_test(NAME compiled_tuned_T16
+  COMMAND mlc exec ${GEN}/gpt2_T16_tuned/model.so --weights ${ARTIFACTS}/graphs/gpt2_weights.bin
+          --input ${ARTIFACTS}/golden/T16_ids.npy --expect ${ARTIFACTS}/golden/T16_logits.npy)
+set_tests_properties(compile_tuned_T16 PROPERTIES FIXTURES_SETUP lib_tuned
+  REQUIRED_FILES "${ARTIFACTS}/graphs/gpt2_T16.json;${CMAKE_SOURCE_DIR}/tuning/cache.json")
+set_tests_properties(compiled_tuned_T16 PROPERTIES FIXTURES_REQUIRED lib_tuned)
 
 # The unoptimized path (every pass off, no memory reuse) stays tested, because
 # it is the baseline every ablation is measured against.

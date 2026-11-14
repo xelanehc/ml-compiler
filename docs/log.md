@@ -270,3 +270,65 @@ Memory at T=1024: arena 157.5 MB to 72.4 MB, plus 342.9 MB persistent. At T=16: 
 - Why `noalias` does not help the unvectorized nest.
 - 340 MB of persistent memory for transposed weights.
 
+## M5: autotuner (2026-11-14)
+
+**Built**
+
+- The matrix product's schedule is now data: `MatmulParams` (register tile, which operand is outside, block rows). `default_matmul_params` computes M4's hand-picked choice; `schedule_kernel` applies any choice with the same rewrites. A kernel carries a signature (op and operand shapes) and `ScheduleOptions::tuned` maps signatures to parameters.
+- `src/tune/`: machine detection (`sysctl` for the CPU name, L1 size, performance cores, power state), the search space, batch measurement, the search, and a JSON cache.
+- `mlc tune <graph> --cache tuning/cache.json -o <dir> [--threads 1,4] [--tune-threshold]`, and `--tuning <cache> [--tuned-threads N]` on `compile`, `loops`, and `gemm`.
+- `tuning/cache.json`: 54 entries (7 products, fewer at T=64 where two share a shape, x 4 sequence lengths x 2 thread counts).
+- `bench/run.py --systems ... mlc-tuned`, and a ctest pair that builds from the cache and checks the logits.
+- Tests: 103 unit tests (5 new). One runs every point of a product's search space, over 100 distinct schedules, through the loop interpreter and requires bit-identical results. The sanitizer build was not rerun for this milestone.
+
+**Numbers**
+
+Measured on AC power, Low Power Mode off: the first session in that state since M2. One core now runs the large products at about 100 GFLOP/s (59 yesterday).
+
+The search tried 33 of 462 points per product and thread count. It replaced the default in 12 of 54 entries. Largest gains in the final round: the T=1024 projection `[1024,3072] x [768,3072]^T` on four threads, 287 to 332 GFLOP/s (5x4 tile, A outside, blocks of 5), and the T=16 output projection on four threads, 296 to 348.
+
+Whole model, default against tuned schedules in alternating runs (`mlc tune`), median seconds:
+
+| | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| 1 thread, default | 0.0473 | 0.1806 | 0.7038 | 3.1761 |
+| 1 thread, tuned | 0.0466 | 0.1814 | 0.6998 | 3.1672 |
+| 4 threads, default | 0.0228 | 0.0628 | 0.2274 | 0.9868 |
+| 4 threads, tuned | 0.0222 | 0.0634 | 0.2300 | 0.9518 |
+
+Separate session through the Python harness (`bench/results/m5.md`), median ms with the minimum in parentheses:
+
+| 1 thread | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| ONNX Runtime | 43.8 (42.1) | 167.5 (161.9) | 685.9 (675.0) | 3208.3 (3187.1) |
+| mlc, default | 47.6 (45.9) | 183.0 (174.7) | 709.3 (689.7) | 3203.3 (3185.7) |
+| mlc, tuned | 47.0 (44.9) | 179.6 (173.8) | 701.7 (690.3) | 3235.8 (3169.8) |
+
+| 4 threads | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| ONNX Runtime | 14.7 (14.0) | 46.3 (46.1) | 189.3 (184.3) | 1020.1 (1005.4) |
+| mlc, default | 22.4 (17.5) | 55.4 (53.6) | 244.6 (212.2) | 1087.7 (1034.9) |
+| mlc, tuned | 23.6 (18.3) | 62.4 (55.3) | 219.4 (206.9) | 1049.5 (997.2) |
+
+The thread threshold (`--tune-threshold`, T=64, four threads) kept the default 65536; the five candidates gave 0.056 to 0.076 s in no order, which says the measurement is noisier than the effect.
+
+**Surprises**
+
+- The exit criterion, "tuned schedules beat hand-picked defaults on the model", is met only weakly. Tuned is ahead by 1.5 to 3.7% at T=16 and at T=1024 on four threads, and within about 1% either way everywhere else, which is noise. In the harness session the tuned build is slower than the default in three of eight cells. The honest summary: on this model the defaults were already at the limit, and the tuner mostly confirmed them. Reproducibility from the cache does hold: the cached build compiles without measuring and passes the golden test.
+- Why so little: for the large products every sensible schedule runs at 97 to 101 GFLOP/s on one core. The kernel is bound by the FMA units, not by the cache, so there is nothing for a cache-shape search to find. The products that did improve are the memory-bound ones (the 154 MB output projection, the 3072-wide projection) on four threads.
+- Mutation found almost nothing that random sampling had not. In most products the best point after two generations is the best random point.
+- A real bug on the way: candidate libraries were rebuilt at the same path, and the tuner reported nonsense (a "winner" 13% slower than the search's best). macOS does not unload a library that has thread-local state, so `dlopen` of a path seen before returned the old code. Every candidate library now gets a fresh path.
+- With a 1% acceptance margin the tuner "found" improvements that a second run did not reproduce. The margin is 2% now. A tuner that fits noise produces a cache that is worse than the defaults on average.
+- On AC the picture against ONNX Runtime is clearer than it was in Low Power Mode. One thread: level at T=1024, 3 to 9% behind below that. Four threads: 3 to 50% behind, worst at T=16 (22.4 against 14.7 ms). The gap is no longer in the matrix products. It is everything else, and thread start-up at small sizes.
+
+**Deviations from the plan**
+
+- Only matrix products are tuned per kernel. The plan listed unroll factors and the parallel loop choice as well; neither showed any measurable effect when tried by hand.
+- The cache is keyed by CPU name, not by a fuller description (cache sizes, power state). The power state is recorded but not checked.
+
+**Open**
+
+- The remaining gap to ONNX Runtime at four threads and small `T`: profile where the 22 ms at T=16 goes (the matrix products alone account for about 11 ms at 370 GFLOP/s).
+- Re-run `bench/run.py`, `bench/gemm.py`, and `bench/ablate.py` on AC so M4's tables match this session's power state.
+- Sanitizer build for M5.
+

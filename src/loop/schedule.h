@@ -16,6 +16,7 @@
 // next rewrite applies to each.
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 
@@ -103,6 +104,19 @@ StmtPtr parallelize(const Program& p, const StmtPtr& body, VarId v);
 
 // ---- The default schedule -------------------------------------------------------
 
+// The schedule of one matrix product in dot form: everything the autotuner
+// varies. A schedule is data; applying it is always the same rewrites.
+struct MatmulParams {
+  int tile_rows = 4, tile_cols = 5;  // the register tile; rows * cols accumulators. 1x1 means no register tiling
+  bool cols_outside = false;         // which operand is blocked and streamed once: Bt's rows (true) or A's (false)
+  int64_t block_rows = 0;            // rows of that operand per cache block; 0 means no cache tiling
+  bool operator==(const MatmulParams&) const = default;
+};
+
+struct MatmulShape {
+  int64_t rows, inner, cols;  // C[rows, cols] = sum over `inner`
+};
+
 struct ScheduleOptions {
   bool vectorize = true;   // run innermost loops in vector lanes where legal
   bool vmath = true;       // vector exp and tanh; without them loops that call those stay scalar
@@ -114,7 +128,20 @@ struct ScheduleOptions {
   bool choose_tile = true;             // may swap the tile, or use 4x4, where that leaves fewer leftover rows
   int64_t block_bytes = 64 << 10;      // how much of L1 one cache block and its company may occupy
   int64_t parallel_work = 1 << 16;     // kernels estimated smaller than this stay on one thread
+
+  // Measured schedules, by kernel signature. A matrix product found here uses
+  // these parameters instead of the default ones.
+  std::map<std::string, MatmulParams> tuned;
 };
+
+// The shape of a dot-form matrix product kernel, and the parameters the
+// default schedule gives a product of that shape.
+MatmulShape matmul_shape(const Kernel& k);
+MatmulParams default_matmul_params(const MatmulShape& shape, const ScheduleOptions& options = {});
+
+// Schedules one kernel in place. `params`, if given, overrides both the tuned
+// table and the defaults for a matrix product.
+void schedule_kernel(const Program& p, Kernel& k, const ScheduleOptions& options, const MatmulParams* params = nullptr);
 
 // Applies the default schedule to every kernel and verifies the result.
 Program schedule_program(Program p, const ScheduleOptions& options = {});

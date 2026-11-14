@@ -11,6 +11,7 @@ Usage:
   python bench/run.py --seq-lens 16 64        # a quick subset
   python bench/run.py --systems ort --threads 4
   python bench/run.py --systems eager compile ort mlc --name m4   # baselines and our compiler, one session
+  python bench/run.py --systems ort mlc mlc-tuned --name m5       # default schedules against tuning/cache.json
 
 The baselines are measured by default. Our compiler ("mlc") is opt-in; give
 the run a --name so the baseline table is not overwritten. Numbers are only
@@ -33,8 +34,8 @@ from model import SEQ_LENS  # noqa: E402
 
 RESULTS = ROOT / "bench" / "results"
 BASELINES = ("eager", "compile", "ort")
-SYSTEMS = BASELINES + ("mlc",)
-LABELS = {"eager": "PyTorch eager", "compile": "torch.compile", "ort": "ONNX Runtime", "mlc": "mlc (ours)"}
+SYSTEMS = BASELINES + ("mlc", "mlc-tuned")
+LABELS = {"eager": "PyTorch eager", "compile": "torch.compile", "ort": "ONNX Runtime", "mlc": "mlc (ours)", "mlc-tuned": "mlc, autotuned (ours)"}
 
 
 def shell(*cmd):

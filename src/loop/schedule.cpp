@@ -691,49 +691,23 @@ int64_t extent_of(const StmtPtr& s, VarId v) {
 // The matrix product  C[i,j] = init;  C[i,j] += A[i,p] * Bt[j,p]  (both
 // operands are read along their rows). See docs/log.md, M4, for the reasoning
 // behind each step.
-StmtPtr schedule_matmul(const Program& p, const Kernel& k, const ScheduleOptions& o) {
+StmtPtr apply_matmul(const Program& p, const Kernel& k, const MatmulParams& q) {
   StmtPtr body = k.body;
-  const int64_t m = extent_of(body, k.mm_i), n = extent_of(body, k.mm_j), depth = extent_of(body, k.mm_p);
 
-  // 0. The register tile. Rows left over when the tile does not divide the
-  //    matrix get a smaller tile with fewer accumulators, which is slower, so
-  //    among the shapes on offer take the one that leaves the least over.
-  int tile_rows = o.tile_rows, tile_cols = o.tile_cols;
-  if (o.choose_tile) {
-    double best = 2;
-    for (auto [r, c] : {std::pair{o.tile_rows, o.tile_cols}, {o.tile_cols, o.tile_rows}, {4, 4}}) {
-      double leftover = static_cast<double>(m % r) / static_cast<double>(m) + static_cast<double>(n % c) / static_cast<double>(n);
-      if (leftover < best - 0.005) {  // a clear improvement only: more accumulators is otherwise better
-        best = leftover;
-        tile_rows = r;
-        tile_cols = c;
-      }
-    }
-  }
+  // 1. Put one operand outside. Its rows are streamed through once, and the
+  //    other operand is the one that is re-read.
+  if (q.cols_outside) body = interchange(p, body, k.mm_i);
+  const VarId big = q.cols_outside ? k.mm_j : k.mm_i, small = q.cols_outside ? k.mm_i : k.mm_j;
+  const int64_t big_tile = q.cols_outside ? q.tile_cols : q.tile_rows, small_tile = q.cols_outside ? q.tile_rows : q.tile_cols;
 
-  // 1. Put the operand with more rows outside. Its rows are then streamed
-  //    through once, and the smaller operand is the one that is re-read.
-  const bool cols_outside = n > m;
-  if (cols_outside) body = interchange(p, body, k.mm_i);
-  const VarId big = cols_outside ? k.mm_j : k.mm_i, small = cols_outside ? k.mm_i : k.mm_j;
-  const int64_t big_tile = cols_outside ? tile_cols : tile_rows, small_tile = cols_outside ? tile_rows : tile_cols;
-
-  // 2. Cache tiling. Cut the big operand into blocks of rows that fit in L1,
-  //    and move the loop over the small operand's rows outside the loop over
-  //    the rows of a block:  for block: for small: for row-in-block.
+  // 2. Cache tiling. Cut the outside operand into blocks of rows that fit in
+  //    L1, and move the loop over the other operand's rows outside the loop
+  //    over the rows of a block:  for block: for small: for row-in-block.
   //    Every row of the small operand then meets a block that is already in L1.
-  //    L1 also has to hold what the block is multiplied against: all of the
-  //    small operand if that is small enough to stay there, otherwise the
-  //    one tile of it in use.
   std::vector<VarId> block_loops = {big};
-  if (o.cachetile) {
-    const int64_t row_bytes = 4 * depth, small_bytes = (cols_outside ? m : n) * row_bytes;
-    const int64_t company = small_bytes <= o.block_bytes ? small_bytes : small_tile * row_bytes;
-    const int64_t budget = std::max(o.block_bytes / 4, o.block_bytes + o.block_bytes / 8 - company);
-    int64_t rows = std::max<int64_t>(1, budget / row_bytes) / big_tile * big_tile;
-    rows = std::max(rows, big_tile);
+  if (q.block_rows > 0) {
     SplitVars s;
-    body = split(body, big, rows, &s);
+    body = split(body, big, q.block_rows, &s);
     block_loops = {s.inner};
     if (s.tail >= 0) block_loops.push_back(s.tail);
     for (VarId v : block_loops) body = interchange(p, body, v);
@@ -742,22 +716,78 @@ StmtPtr schedule_matmul(const Program& p, const Kernel& k, const ScheduleOptions
   // 3. Register tiling. Unroll both row loops into the dot-product loop, so
   //    one pass over p computes tile_rows * tile_cols elements of C at once,
   //    each in its own accumulator.
-  if (o.regtile) {
-    body = unroll_and_jam(p, body, small, small_tile);
-    for (VarId v : block_loops) body = unroll_and_jam(p, body, v, big_tile);
-  }
+  body = unroll_and_jam(p, body, small, small_tile);
+  for (VarId v : block_loops) body = unroll_and_jam(p, body, v, big_tile);
   return body;
 }
 
 }  // namespace
 
+bool is_matmul(const Kernel& k) { return k.mm_i >= 0 && k.mm_j >= 0 && k.mm_p >= 0; }
+
+MatmulShape matmul_shape(const Kernel& k) {
+  if (!is_matmul(k)) throw ScheduleError("kernel " + k.label + " is not a matrix product in dot form");
+  return {extent_of(k.body, k.mm_i), extent_of(k.body, k.mm_p), extent_of(k.body, k.mm_j)};
+}
+
+// The hand-picked schedule: what M4 arrived at by measurement on one machine.
+MatmulParams default_matmul_params(const MatmulShape& shape, const ScheduleOptions& o) {
+  const int64_t m = shape.rows, n = shape.cols, depth = shape.inner;
+  MatmulParams q;
+
+  // The register tile. Rows left over when the tile does not divide the
+  // matrix get a smaller tile with fewer accumulators, which is slower, so
+  // among the shapes on offer take the one that leaves the least over.
+  q.tile_rows = o.tile_rows;
+  q.tile_cols = o.tile_cols;
+  if (o.choose_tile) {
+    double best = 2;
+    for (auto [r, c] : {std::pair{o.tile_rows, o.tile_cols}, {o.tile_cols, o.tile_rows}, {4, 4}}) {
+      double leftover = static_cast<double>(m % r) / static_cast<double>(m) + static_cast<double>(n % c) / static_cast<double>(n);
+      if (leftover < best - 0.005) {  // a clear improvement only: more accumulators is otherwise better
+        best = leftover;
+        q.tile_rows = r;
+        q.tile_cols = c;
+      }
+    }
+  }
+  if (!o.regtile) q.tile_rows = q.tile_cols = 1;
+
+  // The operand with more rows goes outside.
+  q.cols_outside = n > m;
+  const int64_t big_tile = q.cols_outside ? q.tile_cols : q.tile_rows, small_tile = q.cols_outside ? q.tile_rows : q.tile_cols;
+
+  // The block. L1 also has to hold what the block is multiplied against: all
+  // of the small operand if that is small enough to stay there, otherwise the
+  // one tile of it in use.
+  if (o.cachetile) {
+    const int64_t row_bytes = 4 * depth, small_bytes = (q.cols_outside ? m : n) * row_bytes;
+    const int64_t company = small_bytes <= o.block_bytes ? small_bytes : small_tile * row_bytes;
+    const int64_t budget = std::max(o.block_bytes / 4, o.block_bytes + o.block_bytes / 8 - company);
+    q.block_rows = std::max(std::max<int64_t>(1, budget / row_bytes) / big_tile * big_tile, big_tile);
+  }
+  return q;
+}
+
+void schedule_kernel(const Program& p, Kernel& k, const ScheduleOptions& o, const MatmulParams* params) {
+  if (is_matmul(k) && (params || o.regtile || o.cachetile)) {
+    MatmulParams q;
+    auto tuned = o.tuned.find(k.signature);
+    if (params) q = *params;
+    else if (tuned != o.tuned.end()) q = tuned->second;
+    else q = default_matmul_params(matmul_shape(k), o);
+    if (q.tile_rows < 1 || q.tile_cols < 1 || q.block_rows < 0) throw ScheduleError("matrix product parameters out of range");
+    k.body = apply_matmul(p, k, q);
+  }
+  if (o.vectorize) k.body = vectorize_innermost(p, k.body, o);
+  if (o.parallel) k.body = parallelize_outermost(p, k.body, o);
+}
+
 Program schedule_program(Program p, const ScheduleOptions& o) {
   for (std::vector<Kernel>* list : {&p.init_kernels, &p.kernels}) {
     for (Kernel& k : *list) {
       try {
-        if (k.mm_i >= 0 && k.mm_j >= 0 && k.mm_p >= 0 && (o.regtile || o.cachetile)) k.body = schedule_matmul(p, k, o);
-        if (o.vectorize) k.body = vectorize_innermost(p, k.body, o);
-        if (o.parallel) k.body = parallelize_outermost(p, k.body, o);
+        schedule_kernel(p, k, o);
       } catch (const ScheduleError& e) {
         throw ScheduleError("scheduling kernel " + k.label + ": " + e.what());
       }

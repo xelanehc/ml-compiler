@@ -15,6 +15,12 @@
 //                                       compile each distinct matrix product of the model on its own
 //                                       and measure it in GFLOP/s; also writes <dir>/gemm.json
 //
+//   mlc tune    <graph.json> --cache <tuning.json> -o <dir> [--threads 1,4] [--random N] [--generations N]
+//                                       [--seconds S] [--tune-threshold] [--no-model]
+//                                       search for the best schedule of each matrix product by measurement,
+//                                       record it in the cache, and compare the tuned model with the default
+//
+// loops, compile, and gemm take --tuning <tuning.json> [--tuned-threads N] to use such a cache.
 // loops, compile, and gemm optimize first; dump, stats, and run do so with
 // --opt. Wherever that happens, --disable a,b,... turns optimizations off by
 // name (`mlc` with no arguments lists them), and --tile RxC, --block-kb N,
@@ -40,6 +46,7 @@
 #include "loop/ir.h"
 #include "loop/schedule.h"
 #include "support/files.h"
+#include "tune/tuner.h"
 
 using namespace mlc;
 
@@ -57,7 +64,10 @@ int usage() {
                "  mlc exec    <model.so> --weights <weights.bin> --input <ids.npy> [--expect <logits.npy>]\n"
                "              [--tol <abs>] [--runs <n>] [--threads <n>] [--profile]\n"
                "  mlc gemm    <graph.json> -o <dir> [--threads 1,4] [--seconds <per measurement>]\n"
+               "  mlc tune    <graph.json> --cache <tuning.json> -o <dir> [--threads 1,4] [--random <n>] [--generations <n>]\n"
+               "              [--seconds <per candidate>] [--tune-threshold] [--no-model]\n"
                "wherever the model is optimized:\n"
+               "  --tuning <tuning.json> [--tuned-threads <n>]   use measured schedules from `mlc tune`\n"
                "  --disable <name,name,...>   names: %s\n"
                "  --tile <rows>x<cols>  --block-kb <n>  --parallel-work <n>   schedule parameters\n",
                OptOptions::pass_names());
@@ -121,6 +131,22 @@ loop::ScheduleOptions schedule_options(Options& opts, const OptOptions& o) {
     s.choose_tile = false;  // an explicit tile is used exactly as given
   }
   s.block_bytes = std::stoll(opts.value("--block-kb", std::to_string(s.block_bytes >> 10))) << 10;
+  // Measured schedules, if a cache is given. They are specific to a thread
+  // count; the default is the count the runtime itself defaults to.
+  std::string tuning = opts.value("--tuning");
+  std::string tuned_threads = opts.value("--tuned-threads");
+  if (!tuning.empty()) {
+    tune::Machine machine = tune::detect_machine();
+    tune::Cache cache = tune::load_cache(tuning);
+    int threads = tuned_threads.empty() ? machine.performance_cores : std::stoi(tuned_threads);
+    size_t installed = tune::apply_cache(cache, machine, threads, s);
+    if (cache.machine.cpu != machine.cpu)
+      std::fprintf(stderr, "mlc: %s was measured on \"%s\", this is \"%s\"; using default schedules\n", tuning.c_str(),
+                   cache.machine.cpu.c_str(), machine.cpu.c_str());
+    else
+      std::fprintf(stderr, "tuning: %zu measured matrix-product schedules for %d thread%s from %s\n", installed, threads, threads == 1 ? "" : "s",
+                   tuning.c_str());
+  }
   s.parallel_work = std::stoll(opts.value("--parallel-work", std::to_string(s.parallel_work)));
   return s;
 }
@@ -446,6 +472,123 @@ int gemm(const std::string& graph_path, Options opts) {
   return 0;
 }
 
+// Builds the whole model under a schedule and loads it.
+std::unique_ptr<codegen::CompiledModel> build_model(const ImportedModel& model, const std::string& weights_path, const OptOptions& o,
+                                                     const loop::ScheduleOptions& sched, const std::string& dir, int threads) {
+  std::filesystem::create_directories(dir);
+  std::ofstream(dir + "/model.cpp") << codegen::emit_cpp(lower_and_schedule(model.graph, model.weights_bytes, o, sched), {o.noalias});
+  codegen::build_shared_library(dir + "/model.cpp", dir + "/model.so");
+  auto lib = std::make_unique<codegen::CompiledModel>(dir + "/model.so", weights_path);
+  lib->set_threads(threads);
+  return lib;
+}
+
+// The autotuner's driver.
+int tune_command(const std::string& graph_path, Options opts) {
+  std::string cache_path = opts.value("--cache"), out_dir = opts.value("-o"), thread_list = opts.value("--threads", "1,4");
+  tune::TuneOptions t;
+  t.random = std::stoi(opts.value("--random", std::to_string(t.random)));
+  t.generations = std::stoi(opts.value("--generations", std::to_string(t.generations)));
+  t.seconds = std::stod(opts.value("--seconds", std::to_string(t.seconds)));
+  t.seed = static_cast<uint32_t>(std::stoul(opts.value("--seed", "1")));
+  bool tune_threshold = opts.flag("--tune-threshold"), no_model = opts.flag("--no-model");
+  OptOptions o = opt_options(opts);
+  opts.done();
+  if (cache_path.empty() || out_dir.empty()) throw std::runtime_error("tune needs --cache <file> and -o <dir>");
+  t.work_dir = out_dir;
+  t.log = [](const std::string& line) { std::printf("%s\n", line.c_str()); std::fflush(stdout); };
+
+  tune::Machine machine = tune::detect_machine();
+  tune::Cache cache = tune::load_cache(cache_path);
+  if (!cache.products.empty() && cache.machine.cpu != machine.cpu)
+    throw std::runtime_error(cache_path + " holds measurements of \"" + cache.machine.cpu + "\"; use another file for this machine");
+  cache.machine = machine;
+  std::printf("machine: %s, L1 %lld KB, %d performance cores, power: %s\n", machine.cpu.c_str(), static_cast<long long>(machine.l1d_bytes >> 10),
+              machine.performance_cores, machine.power.c_str());
+
+  ImportedModel model = load(graph_path, true, o);
+  std::string weights_path = (std::filesystem::path(graph_path).parent_path() / model.weights_file).string();
+  std::vector<tune::Product> products = tune::products_of(model.graph);
+  if (products.empty()) throw std::runtime_error("the model has no matrix products in dot form (is layout disabled?)");
+
+  // A stand-in input: timing does not depend on which tokens are looked up.
+  std::vector<int64_t> ids(static_cast<size_t>(num_elements(model.graph.type_of(model.graph.inputs.at(0)).shape)));
+  for (size_t i = 0; i < ids.size(); ++i) ids[i] = static_cast<int64_t>(i * 7919 % 50257);
+  std::vector<std::byte> logits(model.graph.type_of(model.graph.outputs.at(0)).byte_size());
+  const void* inputs[] = {ids.data()};
+  void* outputs[] = {logits.data()};
+  auto time_once = [&](const codegen::CompiledModel& lib) {
+    auto t0 = std::chrono::steady_clock::now();
+    lib.run(inputs, outputs);
+    return seconds_since(t0);
+  };
+
+  for (size_t start = 0; start < thread_list.size();) {
+    size_t comma = thread_list.find(',', start);
+    if (comma == std::string::npos) comma = thread_list.size();
+    const int threads = std::stoi(thread_list.substr(start, comma - start));
+    start = comma + 1;
+    t.threads = threads;
+
+    std::printf("\n== %d thread%s: %zu distinct matrix products ==\n", threads, threads == 1 ? "" : "s", products.size());
+    for (const tune::Product& product : products) {
+      std::printf("%s\n", product.signature.c_str());
+      cache.products[{threads, product.signature}] = tune::tune_product(product, machine, t);
+      tune::save_cache(cache_path, cache);  // after every product: an interrupted run keeps what it learned
+    }
+    if (no_model) continue;
+
+    loop::ScheduleOptions plain = schedule_options(opts, o), tuned = plain;
+    tune::apply_cache(cache, machine, threads, tuned);
+
+    // The threshold below which a kernel is not worth threads: a global
+    // parameter, so it is tuned on the whole model.
+    if (tune_threshold && threads > 1) {
+      int64_t best_work = plain.parallel_work;
+      double best_time = 1e30, default_time = 1e30;
+      for (int64_t work : {int64_t{1} << 12, int64_t{1} << 14, int64_t{1} << 16, int64_t{1} << 18, int64_t{1} << 20}) {
+        loop::ScheduleOptions candidate = tuned;
+        candidate.parallel_work = work;
+        auto lib = build_model(model, weights_path, o, candidate, out_dir + "/threshold_" + std::to_string(threads) + "_" + std::to_string(work), threads);
+        double best = 1e30;
+        time_once(*lib);
+        for (int run = 0; run < 15; ++run) best = std::min(best, time_once(*lib));
+        std::printf("parallel threshold %8lld: %.4f s\n", static_cast<long long>(work), best);
+        if (work == plain.parallel_work) default_time = best;
+        if (best < best_time) {
+          best_time = best;
+          best_work = work;
+        }
+      }
+      if (best_time > default_time * 0.98) best_work = plain.parallel_work;  // within noise: keep the default
+      cache.parallel_work[threads] = best_work;
+      tuned.parallel_work = best_work;
+      tune::save_cache(cache_path, cache);
+      std::printf("parallel threshold chosen: %lld\n", static_cast<long long>(best_work));
+    }
+
+    // The composed model, default against tuned, runs alternating so that
+    // whatever the machine is doing affects both alike.
+    auto lib_default = build_model(model, weights_path, o, plain, out_dir + "/model_default_" + std::to_string(threads), threads);
+    auto lib_tuned = build_model(model, weights_path, o, tuned, out_dir + "/model_tuned_" + std::to_string(threads), threads);
+    std::vector<double> a, b;
+    time_once(*lib_default);
+    time_once(*lib_tuned);
+    auto t0 = std::chrono::steady_clock::now();
+    while (a.size() < 5 || (seconds_since(t0) < 10.0 && a.size() < 200)) {
+      a.push_back(time_once(*lib_default));
+      b.push_back(time_once(*lib_tuned));
+    }
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    std::printf("model, %d thread%s, %zu alternating runs:\n  default  min %.4f s  median %.4f s\n  tuned    min %.4f s  median %.4f s   (%.1f%% faster by median)\n",
+                threads, threads == 1 ? "" : "s", a.size(), a.front(), a[a.size() / 2], b.front(), b[b.size() / 2],
+                100.0 * (a[a.size() / 2] / b[b.size() / 2] - 1.0));
+  }
+  std::printf("\nwrote %s\n", cache_path.c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -489,6 +632,7 @@ int main(int argc, char** argv) {
     if (command == "compile") return compile(path, opts);
     if (command == "exec") return exec(path, opts);
     if (command == "gemm") return gemm(path, opts);
+    if (command == "tune") return tune_command(path, opts);
     return usage();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "mlc: %s\n", e.what());

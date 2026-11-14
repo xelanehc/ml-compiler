@@ -120,11 +120,16 @@ Measured in isolation (`mlc gemm`, `bench/gemm.py`) these kernels reach 92 to 97
 
 ### 4.5 Autotuner
 
-- Tunables: the register tile (`rows` x `cols`), the cache block size, which operand is blocked, interleave factors, the size below which a kernel stays on one thread, thread count.
-- Tunes each distinct kernel instance (op + shapes) in isolation on a micro-benchmark, then validates the composed model.
-- Search: random search first, then an evolutionary refinement if random leaves measurable gains. A learned cost model is out of scope.
-- Candidate kernels are compiled to small shared libraries and timed in-process through `dlopen`.
-- Results are cached in JSON keyed by kernel signature and CPU, so a rebuild does not retune.
+`src/tune/`, driven by `mlc tune`. It chooses schedule parameters by timing candidates, and records the result so a later compile needs no measuring.
+
+- **What is tuned:** the schedule of each distinct matrix product (`MatmulParams`): the register tile, which operand is blocked, and the block size. Optionally one global parameter, the size below which a kernel stays on one thread (`--tune-threshold`). Nothing else: every other schedule choice is forced by legality or does not show in a measurement.
+- **The space** is discrete and small (a few hundred points per product): every tile that fits the 32 vector registers with at least 12 accumulators, block sizes as fractions of the L1 data cache (read from `sysctl hw.perflevel0.l1dcachesize`), and either operand outside. Every point is a legal schedule; a test runs all of them through the loop interpreter.
+- **A kernel instance** is identified by its signature, the op and operand shapes (`gemm [16,768] x [2304,768]^T`). Kernels with the same signature are the same loops over different memory, so one measurement serves all twelve layers.
+- **Measuring:** a batch of candidates for one product is compiled into one shared library, the same product several times under different schedules, and timed in-process through `dlopen` with the runtime's per-kernel timer. All candidates in a batch run in turn within each pass, and the minimum over passes is kept.
+- **Search:** the hand-picked default plus random points, then generations of single-step mutations of the best three. Then a final: the best three and the default measured again for three times as long. A candidate replaces the default only if it wins the final by more than 2%.
+- **Validation:** the whole model is built with default and with tuned schedules and the two are timed in alternating runs.
+- **Cache:** `tuning/cache.json`, keyed by CPU, thread count, and signature, committed. `mlc compile --tuning tuning/cache.json --tuned-threads N` reproduces the tuned build. A cache measured on another CPU is ignored with a warning.
+- A learned cost model is out of scope.
 
 ### 4.6 GPU backend (last)
 
@@ -180,10 +185,11 @@ src/
   graph/        IR, verifier, printer, interpreter, passes/
   loop/         IR, interpreter, lowering, schedule rewrites
   codegen/      C++ emitter, ISA layer (neon), build driver
-  tune/         search, measurement, cache
+  tune/         the autotuner: search space, measurement, search, cache
   gpu/          Triton emitter (M7)
   main.cpp      the `mlc` driver
 runtime/        handwritten C++ linked into generated code: arena, thread pool, weight loader, NEON vector math
+tuning/         cache.json: schedules measured by `mlc tune` on the development machine
 bench/          Python: harness, baselines, result tables
   support/      JSON reader, mmap, .npy reader
 tests/          C++ unit and differential tests; end-to-end checks against golden logits (ctest)
@@ -205,7 +211,7 @@ The compiler depends on the C++ standard library and nothing else. The JSON read
 | Export produces ops or patterns we did not expect | Resolved in M1: all 37 ops lower. The surprises (tied embedding transposed at run time, a mask computed from constants on every call, no-op expands, permute chains) are recorded in `docs/log.md` and are M3's work list. |
 | C++ slows iteration on pattern-matching passes | Build a small pattern-matching helper and the IR printer early, in M1. Keep debug builds fast. |
 | Fusion patterns are brittle against export changes | Pin `torch` and `transformers` versions. Pattern-match on our canonicalized IR, not raw ATen. |
-| Autotuning noise on a laptop | Min-of-N timing, re-measure the top candidates, reject results with high variance. |
+| Autotuning noise on a laptop | Min-of-N timing with candidates interleaved in one process, a longer final round against the default, and a 2% margin before the default is replaced. |
 | Where M7 runs | Open. Needs a Linux + CUDA machine. Decide before M6 ends. |
 | Is the KV-cache decode step in scope | Open. It needs a second export and state passed between calls. Decide after M4. |
 

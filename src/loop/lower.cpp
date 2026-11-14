@@ -562,6 +562,7 @@ class Lowerer {
     kernel.mm_i = vi;
     kernel.mm_j = vj;
     kernel.mm_p = vp;
+    kernel.signature = std::string(op_name(n.op)) + " " + shape_string(as) + " x " + shape_string(g_.type_of(b).shape) + "^T";
   }
 
   // Per row r of the input (all axes but the last), with d = row length:
