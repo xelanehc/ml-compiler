@@ -12,9 +12,16 @@ struct CodegenError : std::runtime_error {
   using std::runtime_error::runtime_error;
 };
 
-// The C++17 source for a program: one function per kernel plus the table the
-// runtime reads. Scalar code only; no intrinsics, no threads.
-std::string emit_cpp(const loop::Program& p);
+struct EmitOptions {
+  // Pass each kernel's buffers as `__restrict` pointers where the memory plan
+  // shows they do not overlap, so the C++ compiler may assume it too.
+  bool noalias = true;
+};
+
+// The C++17 source for a program: the kernels plus the tables the runtime
+// reads. Vectorized loops come out as SIMD intrinsics, parallel loops as
+// calls into the runtime's thread pool.
+std::string emit_cpp(const loop::Program& p, const EmitOptions& options = {});
 
 struct BuildOptions {
   std::string compiler = "clang++";  // overridden by the CXX environment variable
@@ -46,6 +53,9 @@ class CompiledModel {
   std::vector<KernelTime> run_profiled(const void* const* inputs, void* const* outputs) const;
 
   int64_t arena_bytes() const;
+  int64_t persistent_bytes() const;
+  void set_threads(int n) const;
+  int threads() const;
   int64_t input_bytes(int i) const;
   int64_t output_bytes(int i) const;
   int num_inputs() const;

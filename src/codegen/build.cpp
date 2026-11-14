@@ -33,7 +33,8 @@ std::string build_shared_library(const std::string& cpp_path, const std::string&
   // -shared -fPIC           build a library that can be loaded at any address
   // -fvisibility=hidden     export only the mlc_* API, not every kernel
   // -std=c++17              the generated code's language level (STEERING.md section 3)
-  std::string command = compiler + " -std=c++17 " + options.flags + " -shared -fPIC -fvisibility=hidden -I" + shell_quote(runtime) + " " +
+  // -pthread               the runtime's thread pool
+  std::string command = compiler + " -std=c++17 " + options.flags + " -pthread -shared -fPIC -fvisibility=hidden -I" + shell_quote(runtime) + " " +
                         shell_quote(cpp_path) + " " + shell_quote(runtime + "/mlc_runtime.cpp") + " -o " + shell_quote(so_path);
   if (std::system((command + " > " + shell_quote(log) + " 2>&1").c_str()) != 0) {
     std::ifstream in(log);
@@ -82,6 +83,9 @@ std::vector<CompiledModel::KernelTime> CompiledModel::run_profiled(const void* c
 }
 
 int64_t CompiledModel::arena_bytes() const { return reinterpret_cast<int64_t (*)()>(symbol("mlc_arena_bytes"))(); }
+int64_t CompiledModel::persistent_bytes() const { return reinterpret_cast<int64_t (*)()>(symbol("mlc_persistent_bytes"))(); }
+void CompiledModel::set_threads(int n) const { reinterpret_cast<void (*)(int32_t)>(symbol("mlc_set_threads"))(n); }
+int CompiledModel::threads() const { return reinterpret_cast<int32_t (*)()>(symbol("mlc_threads"))(); }
 int64_t CompiledModel::input_bytes(int i) const { return reinterpret_cast<int64_t (*)(int32_t)>(symbol("mlc_input_bytes"))(i); }
 int64_t CompiledModel::output_bytes(int i) const { return reinterpret_cast<int64_t (*)(int32_t)>(symbol("mlc_output_bytes"))(i); }
 int CompiledModel::num_inputs() const { return reinterpret_cast<int32_t (*)()>(symbol("mlc_num_inputs"))(); }

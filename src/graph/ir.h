@@ -86,6 +86,8 @@ enum class Op : uint8_t {
   // Linear algebra
   MatMul,     // (a, b) matrix product over the last two axes; leading axes are a batch
   Gemm,       // (a, b, bias) a @ b + bias, with a and b rank 2
+              // For both, attrs.trans_b says b is supplied transposed: [..., n, k] instead of [..., k, n],
+              // and the result is a @ transpose(b). Produced by the layout pass, never imported.
 
   // Composites. Each could be spelled with the ops above; keeping them whole
   // preserves the structure a kernel generator wants to see.
@@ -114,6 +116,7 @@ struct Attrs {
   DType to = DType::F32;      // Cast
   int32_t index = -1;         // Input, Const
   bool causal = false;        // Softmax
+  bool trans_b = false;       // MatMul, Gemm
   bool operator==(const Attrs&) const = default;
 };
 

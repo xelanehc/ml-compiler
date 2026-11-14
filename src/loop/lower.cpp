@@ -1,5 +1,5 @@
-// Graph IR -> loop IR: one naive loop nest per node, plus the decision of
-// where every value lives (memory planning).
+// Graph IR -> loop IR: one naive loop nest per node, plus the decisions of
+// where every value lives (memory planning) and when it is computed (staging).
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -92,6 +92,7 @@ class Lowerer {
 
   Program run() {
     check_graph(g_);
+    if (g_.nodes.size() > 0 && options_.hoist) stage();
     for (ValueId in : g_.inputs) p_.inputs.push_back(g_.type_of(in));
     for (ValueId out : g_.outputs) p_.outputs.push_back(g_.type_of(out));
     analyze();
@@ -102,6 +103,7 @@ class Lowerer {
     }
     copy_unowned_outputs();
     p_.arena_bytes = arena_.peak_bytes();
+    p_.persistent_bytes = persistent_end_;
     p_.unplanned_arena_bytes = arena_.total_bytes();
     check_program(p_);
     return std::move(p_);
@@ -124,7 +126,32 @@ class Lowerer {
   std::vector<Block> block_;              // root -> that block
   std::vector<Block> temps_;              // scratch blocks of the node being lowered
   std::vector<int> copy_outputs_;         // outputs that need an explicit copy at the end
+  std::vector<bool> at_load_;             // graph value -> known once the weights are (see stage())
+  int64_t persistent_end_ = 0;
   VarId next_var_ = 0;
+
+  // Staging, or binding-time analysis: sort values by when they become known.
+  //   compile time   inline constants. Folding (a graph pass) already evaluated
+  //                  what it could of these.
+  //   load time      weights, and anything computed from weights and constants
+  //                  alone. Nothing here depends on the caller's input, so it
+  //                  is the same on every call.
+  //   run time       everything downstream of a graph input.
+  // A load-time value is computed by an init kernel into persistent memory,
+  // once, when the model is opened. It is constant folding for values whose
+  // bytes are not available to the compiler: the fold happens in the runtime.
+  void stage() {
+    at_load_.assign(g_.nodes.size(), false);
+    for (ValueId v = 0; v < g_.nodes.size(); ++v) {
+      const Node& n = g_.nodes[v];
+      if (n.op == Op::Input) continue;
+      bool known = true;
+      for (ValueId in : n.inputs) known = known && at_load_[in];
+      at_load_[v] = known;  // a Const has no inputs and is known
+    }
+  }
+
+  bool at_load(ValueId v) const { return !at_load_.empty() && at_load_[v]; }
 
   // ---- Storage ----
 
@@ -157,7 +184,8 @@ class Lowerer {
     for (size_t k = 0; k < g_.outputs.size(); ++k) {
       ValueId r = root_[g_.outputs[k]];
       Op op = g_.nodes[r].op;
-      if (op != Op::Input && op != Op::Const && output_of_[r] < 0) output_of_[r] = static_cast<int>(k);
+      // (Nor when it is computed at load time, before there is a caller.)
+      if (op != Op::Input && op != Op::Const && !at_load(r) && output_of_[r] < 0) output_of_[r] = static_cast<int>(k);
       else copy_outputs_.push_back(static_cast<int>(k));
     }
 
@@ -223,6 +251,10 @@ class Lowerer {
         storage = Storage::Inline;
         index = static_cast<int32_t>(p_.inline_data.size() - 1);
       }
+    } else if (at_load(v)) {
+      storage = Storage::Persistent;
+      offset = persistent_end_;
+      persistent_end_ += (static_cast<int64_t>(node.type.byte_size()) + kAlign - 1) / kAlign * kAlign;
     } else if (output_of_[v] >= 0) {
       storage = Storage::Output;
       index = output_of_[v];
@@ -277,8 +309,19 @@ class Lowerer {
     return s;
   }
 
-  StmtPtr loop(int64_t extent, const std::function<StmtPtr(const ExprPtr&)>& body) {
+  // A loop of `extent` iterations; one iteration gets the index 0 and no
+  // loop. `id` receives the loop variable, or -1 if there is no loop.
+  StmtPtr loop(int64_t extent, const std::function<StmtPtr(const ExprPtr&)>& body, VarId* id = nullptr) {
+    if (id) *id = -1;
     if (extent == 1) return body(int_imm(0));
+    VarId v = next_var_++;
+    if (id) *id = v;
+    return make_for(v, extent, body(var(v)));
+  }
+
+  // A loop whose extent depends on enclosing loop variables.
+  StmtPtr loop(const ExprPtr& extent, const std::function<StmtPtr(const ExprPtr&)>& body) {
+    if (extent->kind == ExprKind::IntImm) return extent->int_value == 0 ? make_block({}) : loop(extent->int_value, body);
     VarId v = next_var_++;
     return make_for(v, extent, body(var(v)));
   }
@@ -338,11 +381,13 @@ class Lowerer {
 
   // ---- Per-op lowering ----
 
-  void emit(ValueId v, StmtPtr body) {
+  Kernel& emit(ValueId v, StmtPtr body) {
     const Node& n = g_.nodes[v];
     std::string label = "%" + std::to_string(v);
     if (!n.name.empty()) label += " " + n.name;
-    p_.kernels.push_back(Kernel{op_name(n.op), std::move(label), std::move(body)});
+    std::vector<Kernel>& list = at_load(v) ? p_.init_kernels : p_.kernels;
+    list.push_back(Kernel{op_name(n.op), std::move(label), std::move(body)});
+    return list.back();
   }
 
   // out[i...] = f(a[i...], b[i...]) with broadcasting.
@@ -485,6 +530,40 @@ class Lowerer {
     });
   }
 
+  // The same product with the second operand stored transposed, Bt[b.., j, p]:
+  //
+  //   C[b.., i, j] = init;  then  C[b.., i, j] += A[b.., i, p] * Bt[b.., j, p]
+  //
+  // Each element of C is a dot product of a row of A with a row of Bt, both
+  // contiguous in memory. This is the naive nest; the schedule turns it into
+  // the fast one, and needs to know which loop is which.
+  void matmul_dot(ValueId v, const std::function<ExprPtr(const ExprPtr& j)>& init) {
+    const Node& n = g_.nodes[v];
+    ValueId a = n.inputs[0], b = n.inputs[1];
+    const Shape& as = g_.type_of(a).shape;
+    const int64_t m = as[as.size() - 2], k = as.back(), cols = n.type.shape.back();
+    Shape batch(as.begin(), as.end() - 2);
+    VarId vi = -1, vj = -1, vp = -1;
+    StmtPtr body = nest(batch, [&](const Idx& bi) {
+      return loop(m, [&](const ExprPtr& i) {
+        return loop(cols, [&](const ExprPtr& j) {
+          Idx c = concat_idx(concat_idx(bi, i), j);
+          return make_block({
+              write(v, c, init(j)),
+              loop(k, [&](const ExprPtr& p) {
+                ExprPtr product = mul(read(a, concat_idx(concat_idx(bi, i), p)), read(b, concat_idx(concat_idx(bi, j), p)));
+                return write(v, c, add(load(buffer_of_[v], DType::F32, c), product));
+              }, &vp),
+          });
+        }, &vj);
+      }, &vi);
+    });
+    Kernel& kernel = emit(v, std::move(body));
+    kernel.mm_i = vi;
+    kernel.mm_j = vj;
+    kernel.mm_p = vp;
+  }
+
   // Per row r of the input (all axes but the last), with d = row length:
   //   mean[r] = sum_i x[r,i] / d
   //   rstd[r] = 1 / sqrt(sum_i (x[r,i] - mean[r])^2 / d + eps)
@@ -535,26 +614,26 @@ class Lowerer {
       auto at = [&](const ExprPtr& j) { return insert_at(r, axis, j); };
       auto out = [&](const ExprPtr& j) { return load(buffer_of_[v], DType::F32, at(j)); };
       // Causal: the axis is the last one, so the last loop index in `r` is the
-      // row i, and column j takes part only when j <= i. A masked column
-      // contributes -inf to the maximum and 0 to the sum, and its exp is
-      // never evaluated. (A loop that simply stopped at i would be better; it
-      // needs a loop bound that depends on an outer variable, which this IR
-      // does not have yet.)
-      auto when_live = [&](const ExprPtr& j, ExprPtr value, ExprPtr otherwise) {
-        return n.attrs.causal ? select(binary(BinOp::Le, j, r.back()), std::move(value), std::move(otherwise)) : value;
-      };
-      return make_block({
+      // row i, and only columns 0..i take part. The loops simply stop there:
+      // their extent is i + 1, an expression of the enclosing loop variable.
+      // Half the exponentials of the full square are never computed. The
+      // columns after i are set to zero by a loop of their own.
+      const ExprPtr live = n.attrs.causal ? add(r.back(), int_imm(1)) : int_imm(dim);
+      std::vector<StmtPtr> body = {
           make_store(max, r, minus_inf),
-          loop(dim, [&](const ExprPtr& j) { return make_store(max, r, binary(BinOp::Max, max_r, when_live(j, read(x, at(j)), minus_inf))); }),
+          loop(live, [&](const ExprPtr& j) { return make_store(max, r, binary(BinOp::Max, max_r, read(x, at(j)))); }),
           make_store(sum, r, float_imm(0)),
-          loop(dim, [&](const ExprPtr& j) {
+          loop(live, [&](const ExprPtr& j) {
             return make_block({
-                write(v, at(j), when_live(j, call(Intrinsic::Exp, {sub(read(x, at(j)), max_r)}), float_imm(0))),
+                write(v, at(j), call(Intrinsic::Exp, {sub(read(x, at(j)), max_r)})),
                 make_store(sum, r, add(sum_r, out(j))),
             });
           }),
-          loop(dim, [&](const ExprPtr& j) { return write(v, at(j), div(out(j), sum_r)); }),
-      });
+          loop(live, [&](const ExprPtr& j) { return write(v, at(j), div(out(j), sum_r)); }),
+      };
+      if (n.attrs.causal)
+        body.push_back(loop(sub(int_imm(dim), live), [&](const ExprPtr& z) { return write(v, at(add(live, z)), float_imm(0)); }));
+      return make_block(std::move(body));
     });
   }
 
@@ -568,39 +647,49 @@ class Lowerer {
       case Op::Reshape:
         return;  // no code: the value already exists in memory
 
-      case Op::Add: return emit(v, binary_op(v, BinOp::Add));
-      case Op::Sub: return emit(v, binary_op(v, BinOp::Sub));
-      case Op::Mul: return emit(v, binary_op(v, BinOp::Mul));
-      case Op::Eq: return emit(v, binary_op(v, BinOp::Eq));
-      case Op::Ne: return emit(v, binary_op(v, BinOp::Ne));
-      case Op::Le: return emit(v, binary_op(v, BinOp::Le));
-      case Op::And: return emit(v, binary_op(v, BinOp::And));
-      case Op::Pow: return emit(v, elementwise(v, [](X x) { return call(Intrinsic::Pow, {x[0], x[1]}); }));
-      case Op::Tanh: return emit(v, elementwise(v, [](X x) { return call(Intrinsic::Tanh, {x[0]}); }));
+      case Op::Add: return (void)emit(v, binary_op(v, BinOp::Add));
+      case Op::Sub: return (void)emit(v, binary_op(v, BinOp::Sub));
+      case Op::Mul: return (void)emit(v, binary_op(v, BinOp::Mul));
+      case Op::Eq: return (void)emit(v, binary_op(v, BinOp::Eq));
+      case Op::Ne: return (void)emit(v, binary_op(v, BinOp::Ne));
+      case Op::Le: return (void)emit(v, binary_op(v, BinOp::Le));
+      case Op::And: return (void)emit(v, binary_op(v, BinOp::And));
+      case Op::Pow: return (void)emit(v, elementwise(v, [](X x) { return call(Intrinsic::Pow, {x[0], x[1]}); }));
+      case Op::Tanh: return (void)emit(v, elementwise(v, [](X x) { return call(Intrinsic::Tanh, {x[0]}); }));
       case Op::Gelu:
         // 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))) in one pass, with
         // x^3 as two multiplies rather than a call to pow.
-        return emit(v, elementwise(v, [](X x) {
+        return (void)emit(v, elementwise(v, [](X x) {
           ExprPtr cube = mul(mul(x[0], x[0]), x[0]);
           ExprPtr inner = mul(add(x[0], mul(cube, float_imm(0.044715))), float_imm(0.7978845608028654));
           return mul(mul(x[0], float_imm(0.5)), add(call(Intrinsic::Tanh, {inner}), float_imm(1)));
         }));
-      case Op::Not: return emit(v, elementwise(v, [](X x) { return logical_not(x[0]); }));
-      case Op::Where: return emit(v, elementwise(v, [](X x) { return select(x[0], x[1], x[2]); }));
-      case Op::Cast: return emit(v, elementwise(v, [&](X x) { return cast(n.attrs.to, x[0]); }));
-      case Op::Broadcast: return emit(v, elementwise(v, [](X x) { return x[0]; }));
+      case Op::Not: return (void)emit(v, elementwise(v, [](X x) { return logical_not(x[0]); }));
+      case Op::Where: return (void)emit(v, elementwise(v, [](X x) { return select(x[0], x[1], x[2]); }));
+      case Op::Cast: return (void)emit(v, elementwise(v, [&](X x) { return cast(n.attrs.to, x[0]); }));
+      case Op::Broadcast: return (void)emit(v, elementwise(v, [](X x) { return x[0]; }));
 
-      case Op::Permute: return emit(v, permute(v));
-      case Op::Slice: return emit(v, slice(v));
-      case Op::Concat: return emit(v, concat(v));
-      case Op::Gather: return emit(v, gather(v));
-      case Op::CumSum: return emit(v, cumsum(v));
-      case Op::ReduceAny: return emit(v, reduce_any(v));
+      case Op::Permute: return (void)emit(v, permute(v));
+      case Op::Slice: return (void)emit(v, slice(v));
+      case Op::Concat: return (void)emit(v, concat(v));
+      case Op::Gather: return (void)emit(v, gather(v));
+      case Op::CumSum: return (void)emit(v, cumsum(v));
+      case Op::ReduceAny: return (void)emit(v, reduce_any(v));
 
-      case Op::MatMul: return emit(v, matmul_like(v, [](const ExprPtr&) { return float_imm(0); }));
-      case Op::Gemm: return emit(v, matmul_like(v, [&](const ExprPtr& j) { return read(n.inputs[2], {j}); }));
-      case Op::LayerNorm: return emit(v, layer_norm(v));
-      case Op::Softmax: return emit(v, softmax(v));
+      case Op::MatMul: {
+        auto zero = [](const ExprPtr&) { return float_imm(0); };
+        if (n.attrs.trans_b) return matmul_dot(v, zero);
+        emit(v, matmul_like(v, zero));
+        return;
+      }
+      case Op::Gemm: {
+        auto bias = [&](const ExprPtr& j) { return read(n.inputs[2], {j}); };
+        if (n.attrs.trans_b) return matmul_dot(v, bias);
+        emit(v, matmul_like(v, bias));
+        return;
+      }
+      case Op::LayerNorm: return (void)emit(v, layer_norm(v));
+      case Op::Softmax: return (void)emit(v, softmax(v));
     }
     throw LoopError(std::string("no lowering for op ") + op_name(n.op));
   }

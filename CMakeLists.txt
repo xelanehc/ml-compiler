@@ -32,6 +32,7 @@ add_library(mlc_core STATIC
   src/frontend/importer.cpp
   src/loop/ir.cpp
   src/loop/lower.cpp
+  src/loop/schedule.cpp
   src/loop/interpreter.cpp
   src/codegen/emit_cpp.cpp
   src/codegen/build.cpp
@@ -55,6 +56,7 @@ add_executable(mlc_tests
   tests/test_loop.cpp
   tests/test_codegen.cpp
   tests/test_passes.cpp
+  tests/test_schedule.cpp
 )
 target_link_libraries(mlc_tests PRIVATE mlc_core)
 target_include_directories(mlc_tests PRIVATE tests)
@@ -64,8 +66,8 @@ add_test(NAME unit COMMAND mlc_tests)
 # to have been run. For each sequence length:
 #   golden_T<T>    the graph interpreter on the imported graph
 #   optimized_T<T> the graph interpreter on the graph after the optimization passes
-#   compile_T<T>   graph -> loop IR -> C++ -> shared library
-#   compiled_T<T>  the shared library, run on the golden input
+#   compile_T<T>   graph -> loop IR -> schedule -> C++ -> shared library
+#   compiled_T<T>  the shared library, run on the golden input with the default number of threads
 # The two long sequence lengths are labelled "slow" (ctest -LE slow skips them).
 set(ARTIFACTS ${CMAKE_SOURCE_DIR}/artifacts)
 set(GEN ${CMAKE_BINARY_DIR}/gen)
@@ -90,6 +92,12 @@ foreach(T 16 64 256 1024)
 endforeach()
 set_tests_properties(golden_T256 golden_T1024 optimized_T256 optimized_T1024 compile_T256 compile_T1024 compiled_T256 compiled_T1024
   PROPERTIES LABELS slow TIMEOUT 1800)
+
+# The same library on one thread: the serial path through every parallel loop.
+add_test(NAME compiled_T16_one_thread
+  COMMAND mlc exec ${GEN}/gpt2_T16/model.so --weights ${ARTIFACTS}/graphs/gpt2_weights.bin --threads 1
+          --input ${ARTIFACTS}/golden/T16_ids.npy --expect ${ARTIFACTS}/golden/T16_logits.npy)
+set_tests_properties(compiled_T16_one_thread PROPERTIES FIXTURES_REQUIRED lib_T16)
 
 # The unoptimized path (every pass off, no memory reuse) stays tested, because
 # it is the baseline every ablation is measured against.

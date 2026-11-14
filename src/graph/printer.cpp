@@ -45,6 +45,8 @@ std::string attrs_string(const Node& n) {
     case Op::ReduceAny: return ", axis=" + std::to_string(a.axis) + ", keepdims=" + (a.keepdims ? "true" : "false");
     case Op::LayerNorm: return ", eps=" + format_double(a.eps);
     case Op::Cast: return std::string(", to=") + dtype_name(a.to);
+    case Op::MatMul:
+    case Op::Gemm: return a.trans_b ? ", trans_b=true" : "";
     default: return "";
   }
 }

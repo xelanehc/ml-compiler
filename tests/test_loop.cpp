@@ -79,7 +79,7 @@ TEST(lower_gather_out_of_range_is_caught_by_the_loop_interpreter) {
   Graph g;
   ValueId table = random_f32(g, {5, 3}, 1);
   g.outputs = {g.add(Op::Gather, {table, i64(g, {2}, {1, 5})})};
-  Program p = lower_graph(g, 0);
+  Program p = lower_graph(g, 0, kAtRunTime);
   std::vector<std::byte> out(p.outputs[0].byte_size());
   void* ptrs[] = {out.data()};
   CHECK_THROWS(run_program(p, {}, {}, ptrs), LoopError);
@@ -133,7 +133,7 @@ TEST(lower_gives_reshape_no_code_and_no_storage) {
   ValueId t = g.add(Op::Tanh, {a});
   ValueId r = g.add(Op::Reshape, {t}, dims({3, 2}));
   g.outputs = {g.add(Op::Tanh, {r})};
-  Program p = lower_graph(g, 0);
+  Program p = lower_graph(g, 0, kAtRunTime);
   CHECK(p.kernels.size() == 2);  // the two tanh nodes; the constant and the reshape need none
   const Buffer& bt = p.buffers[t];
   const Buffer& br = p.buffers[r];
@@ -146,8 +146,8 @@ TEST(loop_printer) {
   Graph g;
   ValueId a = random_f32(g, {2, 3}, 1), b = random_f32(g, {3, 2}, 2);
   g.outputs = {g.add(Op::MatMul, {a, b})};
-  std::string text = print_program(lower_graph(g, 0));
-  CHECK(text.find("kernel matmul") != std::string::npos);
+  std::string text = print_program(lower_graph(g, 0, kAtRunTime));
+  CHECK(text.find("\nkernel matmul") != std::string::npos);
   CHECK(text.find("for i0 in 0..2:") != std::string::npos);
   CHECK(text.find("v2[i0, i3] = (v2[i0, i3] + (v0[i0, i2] * v1[i2, i3]))") != std::string::npos);
 }
@@ -157,7 +157,7 @@ TEST(loop_verifier_catches_broken_programs) {
     Graph g;
     ValueId a = random_f32(g, {2, 3}, 1);
     g.outputs = {g.add(Op::Tanh, {g.add(Op::Tanh, {a})})};
-    return lower_graph(g, 0);
+    return lower_graph(g, 0, kAtRunTime);
   };
   CHECK(verify_program(make()).empty());
 

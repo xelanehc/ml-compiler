@@ -244,7 +244,8 @@ Graph eliminate_common_subexpressions(const Graph& g) {
       for (ValueId in : n.inputs) append(key, &in, sizeof in);
       key.push_back('|');
       const Attrs& a = n.attrs;
-      for (int64_t x : {a.axis, a.start, a.end, static_cast<int64_t>(a.keepdims), static_cast<int64_t>(a.to), static_cast<int64_t>(a.causal)})
+      for (int64_t x : {a.axis, a.start, a.end, static_cast<int64_t>(a.keepdims), static_cast<int64_t>(a.to), static_cast<int64_t>(a.causal),
+                        static_cast<int64_t>(a.trans_b)})
         append(key, &x, sizeof x);
       append(key, &a.eps, sizeof a.eps);
       for (int64_t d : a.dims) append(key, &d, sizeof d);
@@ -398,6 +399,60 @@ Graph fuse_causal_softmax(const Graph& g) {
   });
 }
 
+// ---- Layout --------------------------------------------------------------------------------
+
+namespace {
+
+// A value equal to `v` with its last two axes swapped, built with as little
+// run-time work as possible.
+ValueId transposed(Graph& out, ValueId v) {
+  const Node n = out.nodes[v];  // a copy: adding nodes below moves the originals
+  const size_t rank = n.type.shape.size();
+  std::vector<int64_t> swap(rank);
+  for (size_t d = 0; d < rank; ++d) swap[d] = static_cast<int64_t>(d);
+  std::swap(swap[rank - 1], swap[rank - 2]);
+
+  // Already the transpose of something: use that something.
+  if (n.op == Op::Permute && n.attrs.dims == swap) return n.inputs[0];
+  // x * scalar, transposed, is transpose(x) * scalar. Moving the transpose
+  // inwards lets it meet, and cancel, a transpose applied before the scaling.
+  if (n.op == Op::Mul || n.op == Op::Add || n.op == Op::Sub) {
+    for (int side : {0, 1}) {
+      if (!out.type_of(n.inputs[1 - side]).shape.empty() || out.type_of(n.inputs[side]).shape != n.type.shape) continue;
+      std::vector<ValueId> inputs = n.inputs;
+      inputs[side] = transposed(out, inputs[side]);
+      return out.add(n.op, inputs, n.attrs, n.name);
+    }
+  }
+  Attrs attrs;
+  attrs.dims = swap;
+  return out.add(Op::Permute, {v}, attrs);
+}
+
+}  // namespace
+
+// Every matrix product a @ b becomes a @ transpose(bt) with bt = transpose(b)
+// stored row by row. Why: element (i, j) of the product is then the dot
+// product of row i of a and row j of bt, two contiguous runs of memory, which
+// is the shape the vectorized kernel wants (see schedule.cpp). The transposes
+// this introduces cost nothing where it matters:
+//   - the output projection's operand was transpose(embedding table) to begin
+//     with, so the two transposes cancel and the table is used as stored;
+//   - a transposed weight depends on nothing but the weights file, so it is
+//     computed once at load time (staging, in lower.cpp);
+//   - in attention, k was transposed for q @ k^T and that cancels too. Only
+//     the value matrix gets a real transpose per call, and it is small.
+Graph transpose_matmul_operands(const Graph& g) {
+  return rewrite(g, [](Graph& out, const Node& n, const Constant*) -> ValueId {
+    if ((n.op != Op::MatMul && n.op != Op::Gemm) || n.attrs.trans_b) return kNoValue;
+    std::vector<ValueId> inputs = n.inputs;
+    inputs[1] = transposed(out, inputs[1]);
+    Attrs attrs = n.attrs;
+    attrs.trans_b = true;
+    return out.add(n.op, inputs, attrs, n.name);
+  });
+}
+
 // ---- The pipeline ------------------------------------------------------------------------
 
 void OptOptions::disable(const std::string& names) {
@@ -410,7 +465,9 @@ void OptOptions::disable(const std::string& names) {
     bool all = name == "all";
     bool known = all;
     for (auto [pass, flag] : {std::pair{"simplify", &simplify}, {"fold", &fold}, {"cse", &cse}, {"gelu", &gelu},
-                              {"attention", &attention}, {"memory", &memory}}) {
+                              {"attention", &attention}, {"memory", &memory}, {"noalias", &noalias}, {"vectorize", &vectorize},
+                              {"vmath", &vmath}, {"layout", &layout}, {"hoist", &hoist}, {"regtile", &regtile},
+                              {"cachetile", &cachetile}, {"parallel", &parallel}}) {
       if (all || name == pass) {
         *flag = false;
         known = true;
@@ -444,6 +501,7 @@ Graph optimize(const Graph& g, const OptOptions& options, std::vector<PassStat>*
   run(options.cse, "cse", eliminate_common_subexpressions);
   run(options.gelu, "gelu", fuse_gelu);
   run(options.attention, "attention", fuse_causal_softmax);
+  run(options.layout, "layout", transpose_matmul_operands);
   return current;
 }
 

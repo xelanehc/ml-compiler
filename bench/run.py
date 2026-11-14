@@ -10,13 +10,12 @@ Usage:
   python bench/run.py                         # everything
   python bench/run.py --seq-lens 16 64        # a quick subset
   python bench/run.py --systems ort --threads 4
-  python bench/run.py --systems mlc --threads 1 --name mlc_m2   # our compiler; writes mlc_m2.md
+  python bench/run.py --systems eager compile ort mlc --name m4   # baselines and our compiler, one session
 
-The baselines are measured by default. Our compiler ("mlc") is opt-in, and
-its results go to a separate file via --name so the baseline table is not
-overwritten. mlc is single-threaded for now and is only run at 1 thread; while
-it is slow, its measuring time is capped (see --mlc-budget), so its cells may
-have fewer than 30 runs. The run count is printed and saved with each result.
+The baselines are measured by default. Our compiler ("mlc") is opt-in; give
+the run a --name so the baseline table is not overwritten. Numbers are only
+comparable within one run of this script: the machine's power state moves
+them by a factor of two (see the "power" lines under Environment).
 """
 
 import argparse
@@ -53,6 +52,7 @@ def environment():
 
     blas = re.search(r"BLAS_INFO=(\w+)", torch.__config__.show())
     power = shell("pmset", "-g", "batt")
+    low_power = re.search(r"lowpowermode\s+(\d)", shell("pmset", "-g"))
     return {
         "date": datetime.date.today().isoformat(),
         "cpu": shell("sysctl", "-n", "machdep.cpu.brand_string"),
@@ -60,6 +60,8 @@ def environment():
         "efficiency_cores": shell("sysctl", "-n", "hw.perflevel1.physicalcpu"),
         "os": f"{platform.system()} {platform.release()} {platform.machine()}",
         "power": "AC" if "AC Power" in power else "battery" if "Battery Power" in power else "unknown",
+        # Low Power Mode caps the clock of the performance cores at roughly half.
+        "low_power_mode": {"1": "on", "0": "off"}.get(low_power.group(1), "unknown") if low_power else "unknown",
         "python": platform.python_version(),
         "torch": torch.__version__,
         "torch_blas": blas.group(1) if blas else "unknown",
@@ -116,8 +118,11 @@ def render(env, rows, seq_lens, name):
     if short:
         cells = ", ".join(f"{LABELS[r['system']]} T={r['seq_len']} ({r['runs']} runs)" for r in short)
         out += [f"Cells measured with fewer than 30 runs because of the time cap: {cells}.", ""]
-    if env["power"] != "AC":
-        out.insert(2, "> **Measured on battery power.** Numbers may be throttled and noisy; rerun on AC before quoting them.\n")
+    if env["power"] != "AC" or env["low_power_mode"] == "on":
+        state = "on battery power" if env["power"] != "AC" else "on AC power"
+        if env["low_power_mode"] == "on":
+            state += " with Low Power Mode on (about half the normal single-core speed)"
+        out.insert(2, f"> **Measured {state}.** Compare only within this table; rerun on AC with Low Power Mode off before quoting.\n")
     return "\n".join(out)
 
 
@@ -127,19 +132,16 @@ def main():
     parser.add_argument("--threads", type=int, nargs="+", default=[1, 4])
     parser.add_argument("--seq-lens", type=int, nargs="+", default=list(SEQ_LENS))
     parser.add_argument("--name", default="baselines", help="basename for the output files")
-    parser.add_argument("--mlc-budget", type=float, default=120.0,
-                        help="seconds of measuring allowed per sequence length for mlc")
+    parser.add_argument("--mlc-budget", type=float, default=0.0,
+                        help="cap, in seconds, on measuring mlc per sequence length; 0 means no cap")
     args = parser.parse_args()
 
     env = environment()
-    print(f"power: {env['power']}   torch BLAS: {env['torch_blas']}")
+    print(f"power: {env['power']}   low power mode: {env['low_power_mode']}   torch BLAS: {env['torch_blas']}")
 
     rows = []
     for system in args.systems:
         for threads in args.threads:
-            if system == "mlc" and threads != 1:
-                print("  mlc is single-threaded for now; skipping threads=" + str(threads))
-                continue
             budget = args.mlc_budget if system == "mlc" else 0.0
             proc = subprocess.run(
                 [sys.executable, str(ROOT / "bench" / "worker.py"),

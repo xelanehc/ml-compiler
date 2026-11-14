@@ -307,26 +307,48 @@ void matmul_accumulate(const float* A, const float* B, float* C, int64_t m, int6
   }
 }
 
+// The same with B supplied transposed, Bt[n, k]: C[i, j] += sum_p A[i, p] * Bt[j, p].
+// Each element is a dot product. A single running sum would have to be added
+// up strictly in order, one float at a time; eight partial sums, combined at
+// the end, are something the C++ compiler can keep in vector registers. This
+// is the one concession to speed in this file, so that the reference still
+// finishes the long sequence lengths in reasonable time.
+void matmul_accumulate_trans_b(const float* A, const float* Bt, float* C, int64_t m, int64_t k, int64_t n) {
+  for (int64_t i = 0; i < m; ++i) {
+    const float* a = A + i * k;
+    for (int64_t j = 0; j < n; ++j) {
+      const float* b = Bt + j * k;
+      float partial[8] = {};
+      int64_t p = 0;
+      for (; p + 8 <= k; p += 8)
+        for (int lane = 0; lane < 8; ++lane) partial[lane] += a[p + lane] * b[p + lane];
+      float sum = 0;
+      for (float part : partial) sum += part;
+      for (; p < k; ++p) sum += a[p] * b[p];
+      C[i * n + j] += sum;
+    }
+  }
+}
+
 Tensor matmul(const Tensor& a, const Tensor& b, const Node& node, const Mem& mem) {
   Tensor out = allocate(node.type, mem);
   const Shape& as = a.type.shape;
-  const Shape& bs = b.type.shape;
-  const int64_t m = as[as.size() - 2], k = as.back(), n = bs.back();
+  const int64_t m = as[as.size() - 2], k = as.back(), n = node.type.shape.back();
   const int64_t batch = a.size() / std::max<int64_t>(m * k, 1);
   float* po = out_data<float>(out);
   std::fill(po, po + out.size(), 0.0f);
   for (int64_t i = 0; i < batch; ++i)
-    matmul_accumulate(a.data<float>() + i * m * k, b.data<float>() + i * k * n, po + i * m * n, m, k, n);
+    (node.attrs.trans_b ? matmul_accumulate_trans_b : matmul_accumulate)(a.data<float>() + i * m * k, b.data<float>() + i * k * n, po + i * m * n, m, k, n);
   return out;
 }
 
 Tensor gemm(const Tensor& a, const Tensor& b, const Tensor& bias, const Node& node, const Mem& mem) {
   Tensor out = allocate(node.type, mem);
-  const int64_t m = a.type.shape[0], k = a.type.shape[1], n = b.type.shape[1];
+  const int64_t m = a.type.shape[0], k = a.type.shape[1], n = node.type.shape[1];
   float* po = out_data<float>(out);
   // Start every output row as a copy of the bias, then accumulate the product on top.
   for (int64_t i = 0; i < m; ++i) std::copy_n(bias.data<float>(), n, po + i * n);
-  matmul_accumulate(a.data<float>(), b.data<float>(), po, m, k, n);
+  (node.attrs.trans_b ? matmul_accumulate_trans_b : matmul_accumulate)(a.data<float>(), b.data<float>(), po, m, k, n);
   return out;
 }
 

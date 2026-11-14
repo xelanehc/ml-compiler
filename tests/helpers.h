@@ -74,22 +74,34 @@ inline bool same_values(const Type& type, const std::byte* a, const std::byte* b
   return true;
 }
 
+// These tests feed kernels from inline constants, where a real model has
+// inputs. With staging on, a value computed from constants alone moves to
+// load time; this option keeps it in the per-call kernels, where the test
+// can look at it.
+inline constexpr loop::LowerOptions kAtRunTime{true, false};
+
+// Runs a lowered program in the loop interpreter and returns its outputs.
+inline std::vector<std::vector<std::byte>> run_loops(const loop::Program& p, std::span<const void* const> inputs = {}) {
+  std::vector<std::vector<std::byte>> got;
+  std::vector<void*> ptrs;
+  for (const Type& t : p.outputs) got.emplace_back(t.byte_size());
+  for (auto& bytes : got) ptrs.push_back(bytes.data());
+  loop::run_program(p, {}, inputs, ptrs);
+  return got;
+}
+
 // The differential test for lowering: run the graph in the graph interpreter,
 // lower it and run the loops in the loop interpreter, and compare every output.
-// The graph must take no inputs and no external weights.
+// The graph must take no inputs and no external weights. Checked twice: with
+// everything computed per call, and with staging moving it to load time.
 inline bool lowering_matches(Graph& g, std::vector<ValueId> outs, double tol = 1e-5) {
   g.outputs = std::move(outs);
   std::vector<Tensor> want = run_graph(g, {}, {});
-  loop::Program p = loop::lower_graph(g, 0);
-  std::vector<std::vector<std::byte>> got;
-  std::vector<void*> ptrs;
-  for (const Type& t : p.outputs) {
-    got.emplace_back(t.byte_size());
-    ptrs.push_back(got.back().data());
+  for (bool hoist : {false, true}) {
+    std::vector<std::vector<std::byte>> got = run_loops(loop::lower_graph(g, 0, {true, hoist}));
+    for (size_t i = 0; i < want.size(); ++i)
+      if (!same_values(want[i].type, want[i].ptr, got[i].data(), tol)) return false;
   }
-  loop::run_program(p, {}, {}, ptrs);
-  for (size_t i = 0; i < want.size(); ++i)
-    if (!same_values(want[i].type, want[i].ptr, got[i].data(), tol)) return false;
   return true;
 }
 

@@ -70,20 +70,40 @@ Graph fuse_gelu(const Graph& g);
 // everywhere" and replaces it with one causal Softmax on the unmasked scores.
 Graph fuse_causal_softmax(const Graph& g);
 
+// Rewrites every matrix product to take its second operand transposed
+// (attrs.trans_b), cancelling the transposes that were already there.
+Graph transpose_matmul_operands(const Graph& g);
+
 // ---- The pipeline ----------------------------------------------------------------
 
+// One switch per optimization, at every level, so that one flag set describes
+// a build and an ablation is a list of names.
 struct OptOptions {
+  // Graph passes.
   bool simplify = true;
   bool fold = true;
   bool cse = true;
   bool gelu = true;
   bool attention = true;
-  bool memory = true;  // memory planning; applied at lowering, carried here so one flag set describes a build
+  bool layout = true;     // transpose_matmul_operands
+  // Applied at lowering (src/loop/lower.cpp).
+  bool memory = true;     // memory planning
+  bool hoist = true;      // compute values that depend only on weights once, at load time
+  // Loop schedule (src/loop/schedule.cpp).
+  bool vectorize = true;
+  bool vmath = true;      // vector exp and tanh
+  bool regtile = true;
+  bool cachetile = true;
+  bool parallel = true;
+  // Code generation.
+  bool noalias = true;    // tell the C++ compiler that a kernel's buffers do not overlap
 
   // Turns passes off by name, from a comma-separated list. "all" turns every
   // pass off. Throws GraphError for a name that is not a pass.
   void disable(const std::string& names);
-  static const char* pass_names() { return "simplify, fold, cse, gelu, attention, memory, all"; }
+  static const char* pass_names() {
+    return "simplify, fold, cse, gelu, attention, memory, noalias, vectorize, vmath, layout, hoist, regtile, cachetile, parallel, all";
+  }
 };
 
 struct PassStat {

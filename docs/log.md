@@ -186,3 +186,87 @@ All four sequence lengths match PyTorch after optimization, in the interpreter a
 
 - Rerun the baselines and the ablation on AC power.
 - Re-run the ablation after M4.
+
+## M4: loop optimizations (2026-11-13)
+
+**Built**
+
+- Loop IR: loops carry a kind (serial, vectorized, parallel) and an interleave count; extents may be expressions of enclosing variables; a `Persistent` storage class and a list of init kernels run once at load.
+- `src/loop/schedule.*`: a dependence test (each iteration owns a slice of every buffer it writes), and the rewrites `split`, `interchange`, `unroll_and_jam`, `vectorize`, `parallelize`, each of which proves itself legal or throws. A default schedule applies them.
+- Graph: `trans_b` on `matmul` and `gemm`, and the `layout` pass that puts every product in dot form and cancels existing transposes.
+- Lowering: staging (`hoist`), the dot-form matrix product, and a causal softmax whose loops stop at column `i`.
+- Codegen: `__restrict` parameters from the memory plan, NEON loops with register accumulators and a scalar leftover loop, fused multiply-add, parallel loops outlined into functions. `src/codegen/isa.h` is the only place that names an intrinsic. `runtime/mlc_neon.h` has vector `exp` and `tanh`.
+- Runtime: a `std::thread` pool with static partitioning and spin-then-sleep workers, persistent memory, `mlc_set_threads`.
+- Tools: `mlc gemm` (each distinct matrix product compiled and timed alone), `bench/gemm.py` (the same products in ONNX Runtime and Accelerate), `bench/ablate.py --stage m4`, and `bench/run.py` now records Low Power Mode.
+- Tests: 98 unit tests (15 new), green in release and under ASan + UBSan, where the generated code is sanitized too and the real model was run at T=16 and T=64 with threads. T=256 and T=1024 were checked in release only.
+
+**Numbers**
+
+Everything below was measured on battery with Low Power Mode on. In that state one core peaks at about 59 GFLOP/s on an in-cache FMA loop (4 FMAs per cycle at about 1.85 GHz); on AC it should be nearly twice that. The tables are consistent with each other and with nothing else.
+
+Whole model, median ms (`bench/results/m4.md`, all four systems in one session):
+
+| 1 thread | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| PyTorch eager (Accelerate) | 37.2 | 98.2 | 302.8 | 1077.6 |
+| ONNX Runtime | 70.8 | 279.3 | 1166.3 | 5339.3 |
+| mlc after M3 (`m4_ablation_*`) | 1050 | 3876 | 15719 | 63582 |
+| mlc | 75.6 | 292.9 | 1189.3 | 5381.2 |
+
+| 4 threads, median (min) | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| PyTorch eager | 38.0 (34.0) | 84.3 (75.2) | 188.7 (181.0) | 754.6 (632.1) |
+| ONNX Runtime | 44.2 (25.8) | 140.7 (106.8) | 568.2 (450.2) | 3063.0 (2864.0) |
+| mlc | 51.5 (33.5) | 182.2 (111.1) | 673.9 (360.8) | 3187.2 (2975.7) |
+
+Matrix products alone, GFLOP/s weighted by the model's use (`bench/results/gemm_T16.md`, `gemm_T1024.md`):
+
+| | T=16, 1 thr | T=16, 4 thr | T=1024, 1 thr | T=1024, 4 thr |
+|---|---:|---:|---:|---:|
+| mlc | 54.6 | 188.8 | 56.9 | 221.2 |
+| ONNX Runtime `MatMul` | 43.7 | 100.5 | 50.0 | 164.7 |
+| PyTorch (Accelerate) | 274.5 | 303.0 | 585.7 | 617.0 |
+
+Attribution, one optimization switched on at a time, seconds, one thread until the last row (`m4_ablation_cumulative.md`, `m4_ablation_T1024.md`):
+
+| | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| graph passes only (M3) | 1.050 | 3.876 | 15.719 | 63.58 |
+| + noalias | 1.047 | 3.884 | 15.656 | |
+| + vectorize | 0.433 | 1.435 | 5.552 | |
+| + vmath | 0.434 | 1.406 | 5.608 | |
+| + layout | 0.356 | 1.111 | 4.183 | |
+| + hoist | 0.247 | 0.996 | 4.106 | |
+| + regtile | 0.075 | 0.296 | 1.221 | |
+| + cachetile | 0.075 | 0.292 | 1.178 | 5.372 |
+| + parallel, 4 threads | 0.027 | 0.086 | 0.345 | 1.547 |
+
+Memory at T=1024: arena 157.5 MB to 72.4 MB, plus 342.9 MB persistent. At T=16: arena 154.4 MB to 0.3 MB, plus 339.8 MB persistent. Load takes about 0.09 s once the weights are in the page cache.
+
+**Surprises**
+
+- We do not beat ONNX Runtime, which was the target. On one thread we are 1 to 7% slower at every `T`. On four threads the medians are 4 to 30% slower and the minimums are mixed (ours is better at T=256, worse elsewhere); four-thread medians in this power state swing by a factor of two between runs, so that comparison is not settled.
+- Our matrix products alone are faster than ONNX Runtime's `MatMul` alone, yet the whole model is slower. Two reasons. ONNX Runtime inside the model does better than its standalone `MatMul` (its whole-model rate at T=1024 is 54.6 GFLOP/s, above the 50.0 it shows alone, so the standalone number undersells it, and one shape there measured an implausible 25.6). And our time outside matrix products is about 0.2 s at T=1024, 4% of the run: permutes, slices, softmax, GELU.
+- Both ONNX Runtime and we are at the core's limit. Its best shapes reach 60 to 61 GFLOP/s where ours reach 58, against a 59 to 62 in-cache peak. A spike showed the outer-product (BLIS-style) inner loop peaks about 5% above the dot-product one (62.4 against 59.4). That 5% is the price of the no-packing design, in this power state.
+- `noalias` alone did nothing (1.050 to 1.047 s), although M2 found that aliasing was why clang would not vectorize `gemm`. With `__restrict` clang's report changes, but the old `i, p, j` nest still runs at the same speed. I did not find out why. Leave-one-out is also inconclusive on it (slower without at T=64, faster without at T=256).
+- `layout` on its own is a large slowdown: with the vectorizer off, the dot-form model takes 2.6 s at T=16 against 1.05 s for the M3 build. A dot product is a float reduction, which the C++ compiler may not reorder and therefore cannot vectorize. The layout only pays once our own vectorizer, which is allowed to reorder, is on.
+- `regtile` is the largest single step (3.3x). One dot product has one accumulator, and the next add must wait three cycles for the previous one; twenty accumulators keep all four FMA units busy.
+- `cachetile` adds 0 to 4% on one thread, though leave-one-out at T=64 on four threads shows 0.089 against 0.149 s. In Low Power Mode the core is slow relative to memory, so cache misses cost less. Expect it to matter more on AC.
+- The first version of the vectorizer refused the tiled loop: it counted the other 19 accumulators in the same buffer as conflicts. The model was correct and ran at 1.47 s at T=16, slower than M3. The check now reasons per element. A wrong legality test that errs towards "no" costs speed silently, so the tests now assert which loops are vectorized.
+- Leftover rows matter more than expected. A 64-column product with a 5-wide tile leaves 4 columns, 6% of the work, and done one column at a time they ran at a third of the speed. Leftovers are now jammed into a smaller tile and the tile shape is chosen per product to leave little over (49 to 57 GFLOP/s on that shape).
+- Four-thread runs at T=1024 are throttled: the first run of a session takes 1.55 s and later ones about 3.2 s. The 1.547 s in the attribution table and the 3187 ms in the comparison table are the same build.
+- Low Power Mode was on for this whole session, and probably for the earlier "battery" sessions. It explains why M3's numbers were 1.7x slower than M2's.
+
+**Deviations from the plan**
+
+- No operand packing and no micro-kernel template (STEERING.md section 4.3 has the reasoning). The cost is the 5% above and 340 MB of transposed weights.
+- Rewrites not built because nothing needed them: `fuse`, `unroll` on its own, a general `reorder`.
+- Cache sizes are a hand-picked constant, not read from `sysctl`. That moves to M5.
+
+**Open**
+
+- Re-measure everything on AC with Low Power Mode off: `bench/run.py --systems eager compile ort mlc --name m4`, `bench/gemm.py`, `bench/ablate.py`.
+- The remaining gap to ONNX Runtime: the non-matmul 4%, the small-`k` product (`q @ k^T`, 49 against its 59 GFLOP/s), and four-thread behaviour at small `T`.
+- Why `noalias` does not help the unvectorized nest.
+- 340 MB of persistent memory for transposed weights.
+

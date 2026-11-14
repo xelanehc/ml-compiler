@@ -274,9 +274,9 @@ Type infer_type(Op op, std::span<const Type> in, const Attrs& attrs) {
       r.require(a.size() >= 2 && a.size() == b.size(), "operands must have equal rank of at least 2");
       size_t n = a.size();
       r.require(std::equal(a.begin(), a.end() - 2, b.begin()), "batch axes must match");
-      r.require(a[n - 1] == b[n - 2], "inner dimensions must match");
-      Shape out(a.begin(), a.end() - 1);  // batch..., rows of a
-      out.push_back(b[n - 1]);            // columns of b
+      r.require(a[n - 1] == b[attrs.trans_b ? n - 1 : n - 2], "inner dimensions must match");
+      Shape out(a.begin(), a.end() - 1);          // batch..., rows of a
+      out.push_back(b[attrs.trans_b ? n - 2 : n - 1]);  // columns of b
       return {DType::F32, out};
     }
 
@@ -286,9 +286,10 @@ Type infer_type(Op op, std::span<const Type> in, const Attrs& attrs) {
       const Shape& a = in[0].shape;
       const Shape& b = in[1].shape;
       r.require(a.size() == 2 && b.size() == 2, "matrices must be rank 2");
-      r.require(a[1] == b[0], "inner dimensions must match");
-      r.require(in[2].shape == Shape{b[1]}, "bias must be a vector with one entry per output column");
-      return {DType::F32, {a[0], b[1]}};
+      const int64_t inner = attrs.trans_b ? b[1] : b[0], cols = attrs.trans_b ? b[0] : b[1];
+      r.require(a[1] == inner, "inner dimensions must match");
+      r.require(in[2].shape == Shape{cols}, "bias must be a vector with one entry per output column");
+      return {DType::F32, {a[0], cols}};
     }
 
     case Op::LayerNorm: {

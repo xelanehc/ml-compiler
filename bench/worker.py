@@ -135,6 +135,7 @@ def build_mlc(model, ids_np, threads):
     lib.mlc_last_error.restype = ctypes.c_char_p
     if lib.mlc_open(str(graphs / "gpt2_weights.bin").encode()) != 0:
         raise SystemExit(f"mlc_open failed: {lib.mlc_last_error().decode()}")
+    lib.mlc_set_threads(threads)
 
     # mlc_run takes an array of input pointers and an array of output
     # pointers. The arrays are built once; each call then just runs the model,

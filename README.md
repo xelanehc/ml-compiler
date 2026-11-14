@@ -4,7 +4,7 @@ A small ahead-of-time ML compiler that runs GPT-2 small on a CPU.
 
 It takes the real PyTorch model through `torch.export`, lowers it into its own graph IR, optimizes the graph, lowers again to a loop-level IR, applies tiling, vectorization, and multi-threading, and emits C++ with SIMD intrinsics. An autotuner picks kernel parameters by measurement. The compiler itself is written in C++, and the code it generates calls no BLAS library.
 
-**Status:** M3 complete. GPT-2 compiles end to end and reproduces PyTorch's logits at every sequence length. Graph optimizations (simplification, constant folding, CSE, GELU and attention fusion) cut the graph from 1062 nodes to 615, and memory planning cuts the arena at T=1024 from 6.5 GB to 158 MB. The generated loops are still naive, so it remains far slower than the baselines; loop optimization is next. See [STEERING.md](STEERING.md) for the design, milestones, and exit criteria.
+**Status:** M4 complete. GPT-2 compiles end to end and reproduces PyTorch's logits at every sequence length. Loop optimizations (a transposed-operand layout for matrix products, register and cache tiling, NEON vectorization, load-time staging, threads) took one-thread time at T=1024 from 63.6 s to 5.4 s, and four threads bring it to between 1.5 and 3.2 s depending on throttling. That is within 1 to 7% of ONNX Runtime on one thread, and not yet ahead of it. All current numbers were taken on battery in Low Power Mode and need re-measuring on AC. See [STEERING.md](STEERING.md) for the design, milestones, and exit criteria, and [docs/log.md](docs/log.md) for what each milestone found.
 
 ## Pipeline
 
@@ -12,7 +12,7 @@ It takes the real PyTorch model through `torch.export`, lowers it into its own g
 GPT-2 (PyTorch)
    |  torch.export
    v
-Graph IR      constant folding, operator fusion, memory planning
+Graph IR      constant folding, operator fusion, layout, memory planning
    |
    v
 Loop IR       tiling, vectorization, multi-threading
@@ -33,7 +33,7 @@ A GPU backend that emits Triton kernels from the same graph IR comes last.
 | M1 | Frontend, graph IR, reference interpreter | done |
 | M2 | Naive end-to-end scalar codegen | done |
 | M3 | Graph optimizations | done |
-| M4 | Loop optimizations and SIMD kernels | not started |
+| M4 | Loop optimizations and SIMD kernels | done |
 | M5 | Autotuner | not started |
 | M6 | Final CPU benchmark and writeup | not started |
 | M7 | Triton GPU backend | not started |
@@ -42,7 +42,19 @@ A GPU backend that emits Triton kernels from the same graph IR comes last.
 
 Compared end to end against PyTorch eager, `torch.compile` on CPU, and ONNX Runtime: same machine, same inputs, fp32, batch 1, equal thread counts. Methodology is in [STEERING.md](STEERING.md#7-benchmarking-rules).
 
-Baseline numbers are in [bench/results/baselines.md](bench/results/baselines.md). The compiler's unoptimized starting point is in [bench/results/mlc_m2.md](bench/results/mlc_m2.md), produced by `python bench/run.py --systems mlc --threads 1 --name mlc_m2`. What each graph optimization pass contributes is in [bench/results/m3_ablation_cumulative.md](bench/results/m3_ablation_cumulative.md). A side-by-side table will be added here once the compiler is worth comparing.
+Current results, all four systems measured in one session: [bench/results/m4.md](bench/results/m4.md) (`python bench/run.py --systems eager compile ort mlc --name m4`). Median latency in ms on one thread, on battery with Low Power Mode on:
+
+| system | T=16 | T=64 | T=256 | T=1024 |
+|---|---:|---:|---:|---:|
+| PyTorch eager (Accelerate) | 37.2 | 98.2 | 302.8 | 1077.6 |
+| ONNX Runtime | 70.8 | 279.3 | 1166.3 | 5339.3 |
+| mlc (ours) | 75.6 | 292.9 | 1189.3 | 5381.2 |
+
+Supporting tables:
+
+- Matrix products alone against ONNX Runtime and Accelerate: [gemm_T16.md](bench/results/gemm_T16.md), [gemm_T1024.md](bench/results/gemm_T1024.md) (`python bench/gemm.py --seq-len 1024`).
+- What each loop optimization contributes: [m4_ablation_cumulative.md](bench/results/m4_ablation_cumulative.md), [m4_ablation_leave_one_out.md](bench/results/m4_ablation_leave_one_out.md), [m4_ablation_T1024.md](bench/results/m4_ablation_T1024.md) (`python bench/ablate.py`).
+- Earlier stages: [baselines.md](bench/results/baselines.md), [mlc_m2.md](bench/results/mlc_m2.md), and the graph-pass ablations `m3_ablation_*.md`.
 
 ## Scope
 
@@ -89,20 +101,27 @@ build/release/mlc run artifacts/graphs/gpt2_T16.json \
 build/release/mlc opt artifacts/graphs/gpt2_T16.json
 build/release/mlc dump artifacts/graphs/gpt2_T16.json --opt | less        # the optimized graph
 
-# Print the loop IR (what each graph node becomes as loops)
+# Print the loop IR: each graph node as loops, after scheduling (tiled, vectorized, parallel)
 build/release/mlc loops artifacts/graphs/gpt2_T16.json | less
+build/release/mlc loops artifacts/graphs/gpt2_T16.json --disable vectorize,regtile,cachetile,parallel | less   # the naive nests
 
 # Compile to C++ and a shared library, then run it against the golden logits
 build/release/mlc compile artifacts/graphs/gpt2_T16.json -o build/release/gen/gpt2_T16
 build/release/mlc exec build/release/gen/gpt2_T16/model.so --weights artifacts/graphs/gpt2_weights.bin \
-    --input artifacts/golden/T16_ids.npy --expect artifacts/golden/T16_logits.npy --runs 5 --profile
+    --input artifacts/golden/T16_ids.npy --expect artifacts/golden/T16_logits.npy --runs 20 --threads 4 --profile
 
-# Benchmark the compiled model from Python (compiles each T first); writes bench/results/mlc_m2.md
-.venv/bin/python bench/run.py --systems mlc --threads 1 --name mlc_m2
+# Benchmark the baselines and the compiled model in one session; writes bench/results/m4.md
+.venv/bin/python bench/run.py --systems eager compile ort mlc --name m4
 
-# Attribute speed and memory to individual passes; writes bench/results/m3_ablation_*.md
-.venv/bin/python bench/ablate.py
-build/release/mlc compile artifacts/graphs/gpt2_T16.json -o build/release/gen/no_gelu --disable gelu,memory   # any subset by hand
+# Time the model's matrix products alone, against ONNX Runtime and Accelerate; writes bench/results/gemm_T1024.md
+build/release/mlc gemm artifacts/graphs/gpt2_T1024.json -o build/release/gen/gemm_T1024    # ours only
+.venv/bin/python bench/gemm.py --seq-len 1024
+
+# Attribute speed and memory to individual optimizations; writes bench/results/m4_ablation_*.md
+.venv/bin/python bench/ablate.py                    # loop optimizations, one switched on at a time
+.venv/bin/python bench/ablate.py --stage m3         # graph passes (the M3 tables)
+build/release/mlc compile artifacts/graphs/gpt2_T16.json -o build/release/gen/no_tile --disable regtile,parallel   # any subset by hand
+build/release/mlc compile artifacts/graphs/gpt2_T16.json -o build/release/gen/tile44 --tile 4x4 --block-kb 32      # schedule parameters
 
 # The same tests under AddressSanitizer and UndefinedBehaviorSanitizer (slow: debug build)
 cmake -S . -B build/asan -DCMAKE_BUILD_TYPE=Debug -DMLC_SANITIZE=ON
@@ -117,7 +136,7 @@ The first run downloads the GPT-2 weights from Hugging Face. The full benchmark 
 ```
 export/       Python: torch.export -> graph.json + weights.bin
 src/          the compiler (C++): frontend, graph, loop, codegen, support; later tune, gpu
-runtime/      handwritten C++ linked into generated code: arena, thread pool, weight loader
+runtime/      handwritten C++ linked into generated code: arena, thread pool, weight loader, NEON exp and tanh
 bench/        Python benchmark harness and baselines
 tests/
 docs/         build log and notes

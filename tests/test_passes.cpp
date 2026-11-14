@@ -308,7 +308,7 @@ TEST(optimize_pipeline_on_exported_patterns) {
   CHECK(count(out, Op::Softmax) == 2 && count(out, Op::Gelu) == 1 && count(out, Op::Permute) == 1);
   CHECK(count(out, Op::Where) == 0 && count(out, Op::Broadcast) == 0 && count(out, Op::Pow) == 0);
   CHECK(out.nodes.size() == 7);  // scores, softmax, tanh, softmax, permute, reshape, gelu
-  CHECK(stats.size() == 6);
+  CHECK(stats.size() == 7);  // dce, then one row per graph pass
   for (const PassStat& s : stats) CHECK(s.nodes_after <= s.nodes_before);
   CHECK(stats.back().nodes_after == out.nodes.size());
 
@@ -345,8 +345,8 @@ TEST(memory_planning_reuses_dead_buffers) {
   ValueId v = random_f32(g, {8, 8}, 1);
   for (int k = 0; k < 10; ++k) v = g.add(Op::Permute, {v}, dims({1, 0}));
   g.outputs = {g.add(Op::Tanh, {v})};
-  loop::Program planned = loop::lower_graph(g, 0);
-  loop::Program naive = loop::lower_graph(g, 0, {false});
+  loop::Program planned = loop::lower_graph(g, 0, kAtRunTime);
+  loop::Program naive = loop::lower_graph(g, 0, {false, false});
   CHECK(naive.arena_bytes == 10 * 256);
   CHECK(planned.arena_bytes == 2 * 256);
   CHECK(planned.unplanned_arena_bytes == naive.arena_bytes);
@@ -358,7 +358,7 @@ TEST(memory_planning_runs_elementwise_ops_in_place) {
   ValueId v = g.add(Op::Permute, {random_f32(g, {8, 8}, 1)}, dims({1, 0}));
   for (int k = 0; k < 10; ++k) v = g.add(Op::Tanh, {g.add(Op::Add, {v, scalar(g, 0.1)})});
   g.outputs = {g.add(Op::Permute, {v}, dims({1, 0}))};
-  CHECK(loop::lower_graph(g, 0).arena_bytes == 256);  // twenty ops, one buffer
+  CHECK(loop::lower_graph(g, 0, kAtRunTime).arena_bytes == 256);  // twenty ops, one buffer
   CHECK(lowering_matches(g, g.outputs));
 }
 
@@ -390,7 +390,7 @@ TEST(memory_planning_in_place_with_broadcast_and_shared_operands) {
 TEST(memory_planning_matches_no_planning_on_the_toy_transformer) {
   Graph g;
   g.outputs = {tiny_transformer(g, i64(g, {1, 5}, {3, 10, 0, 7, 3}))};
-  loop::Program planned = loop::lower_graph(g, 0), naive = loop::lower_graph(g, 0, {false});
+  loop::Program planned = loop::lower_graph(g, 0, kAtRunTime), naive = loop::lower_graph(g, 0, {false, false});
   CHECK(planned.arena_bytes < naive.arena_bytes / 3);
   std::vector<std::byte> a(planned.outputs[0].byte_size()), b(a.size());
   void* pa[] = {a.data()};

@@ -121,6 +121,10 @@ ExprPtr binary(BinOp op, ExprPtr a, ExprPtr b) {
       if (is_int_imm(a, 0)) return b;
       if (is_int_imm(b, 0)) return a;
     }
+    if (op == BinOp::Sub) {
+      if (is_int_const(a) && is_int_const(b)) return int_imm(a->int_value - b->int_value);
+      if (is_int_imm(b, 0)) return a;
+    }
     if (op == BinOp::Mul) {
       if (is_int_const(a) && is_int_const(b)) return int_imm(a->int_value * b->int_value);
       if (is_int_imm(a, 0) || is_int_imm(b, 0)) return int_imm(0);
@@ -170,13 +174,20 @@ ExprPtr cast(DType to, ExprPtr a) {
 
 // ---- Statement constructors ---------------------------------------------------------
 
-StmtPtr make_for(VarId v, int64_t extent, StmtPtr body) {
+StmtPtr make_for(VarId v, int64_t extent, StmtPtr body) { return make_for(v, int_imm(extent), std::move(body)); }
+
+StmtPtr make_for(VarId v, ExprPtr extent, StmtPtr body, LoopKind kind, int interleave) {
+  if (extent->type != DType::I64) throw LoopError("a loop extent must be i64");
   Stmt s = new_stmt(StmtKind::For);
   s.var = v;
-  s.extent = extent;
+  s.extent = std::move(extent);
+  s.loop_kind = kind;
+  s.interleave = interleave;
   s.body = std::move(body);
   return std::make_shared<const Stmt>(std::move(s));
 }
+
+int64_t const_extent(const Stmt& loop) { return is_int_const(loop.extent) ? loop.extent->int_value : -1; }
 
 StmtPtr make_store(BufferId buffer, std::vector<ExprPtr> indices, ExprPtr value) {
   Stmt s = new_stmt(StmtKind::Store);
@@ -215,7 +226,10 @@ void print_stmt(const Program& p, const StmtPtr& s, int depth, std::string& out)
   std::string pad(static_cast<size_t>(depth) * 2, ' ');
   switch (s->kind) {
     case StmtKind::For:
-      out += pad + "for i" + std::to_string(s->var) + " in 0.." + std::to_string(s->extent) + ":\n";
+      out += pad;
+      if (s->loop_kind == LoopKind::Parallel) out += "parallel ";
+      if (s->loop_kind == LoopKind::Vectorized) out += s->interleave > 1 ? "vector(x" + std::to_string(s->interleave) + ") " : "vector ";
+      out += "for i" + std::to_string(s->var) + " in 0.." + print_expr(p, s->extent) + ":\n";
       print_stmt(p, s->body, depth + 1, out);
       break;
     case StmtKind::Store:
@@ -266,13 +280,16 @@ std::string print_kernel(const Program& p, const Kernel& k) {
 std::string print_program(const Program& p) {
   std::string out;
   for (const Buffer& b : p.buffers) {
-    static const char* where[] = {"arena", "weights", "input", "output", "inline"};
+    static const char* where[] = {"arena", "weights", "input", "output", "inline", "persistent"};
     out += "buffer " + b.name + ": " + type_string({b.dtype, b.shape}) + " @ " + where[static_cast<int>(b.storage)];
-    if (b.storage == Storage::Arena || b.storage == Storage::Weights) out += "+" + std::to_string(b.offset);
+    if (b.storage == Storage::Arena || b.storage == Storage::Weights || b.storage == Storage::Persistent) out += "+" + std::to_string(b.offset);
     else out += "[" + std::to_string(b.index) + "]";
     out += "\n";
   }
-  out += "arena: " + std::to_string(p.arena_bytes) + " bytes\n\n";
+  out += "arena: " + std::to_string(p.arena_bytes) + " bytes\n";
+  if (p.persistent_bytes) out += "persistent: " + std::to_string(p.persistent_bytes) + " bytes\n";
+  out += "\n";
+  for (const Kernel& k : p.init_kernels) out += "init " + print_kernel(p, k) + "\n";
   for (const Kernel& k : p.kernels) out += print_kernel(p, k) + "\n";
   return out;
 }
@@ -281,11 +298,19 @@ std::string print_program(const Program& p) {
 
 namespace {
 
+bool contains_loop(const StmtPtr& s) {
+  if (s->kind == StmtKind::For) return true;
+  for (const StmtPtr& child : s->stmts)
+    if (contains_loop(child)) return true;
+  return false;
+}
+
 struct Verifier {
   const Program& p;
   std::vector<std::string> errors;
   std::string where;
   std::set<VarId> scope;
+  bool init = false;  // verifying an init kernel
 
   void report(const std::string& what) { errors.push_back(where + ": " + what); }
 
@@ -322,10 +347,33 @@ struct Verifier {
     }
   }
 
+  // An init kernel runs before there is a caller, so it must not read inputs.
+  void no_caller_memory(const ExprPtr& e) {
+    if (e->kind == ExprKind::Load && buffer_ok(e->buffer) && p.buffers[e->buffer].storage == Storage::Input)
+      report("init kernel reads input buffer " + p.buffers[e->buffer].name);
+    for (const ExprPtr& a : e->args) no_caller_memory(a);
+  }
+  void no_caller_memory(const StmtPtr& s) {
+    if (s->kind == StmtKind::For) return no_caller_memory(s->body);
+    if (s->kind == StmtKind::Block) {
+      for (const StmtPtr& child : s->stmts) no_caller_memory(child);
+      return;
+    }
+    for (const ExprPtr& i : s->indices) no_caller_memory(i);
+    no_caller_memory(s->value);
+  }
+
   void stmt(const StmtPtr& s) {
     switch (s->kind) {
       case StmtKind::For:
-        if (s->extent < 0) report("loop with a negative extent");
+        if (!s->extent || s->extent->type != DType::I64) {
+          report("loop extent is not i64");
+        } else {
+          if (const_extent(*s) < 0 && s->extent->kind == ExprKind::IntImm) report("loop with a negative extent");
+          expr(s->extent);  // may use enclosing loop variables only: its own is not in scope yet
+        }
+        if (s->interleave < 1) report("loop with interleave below 1");
+        if (s->loop_kind == LoopKind::Vectorized && contains_loop(s->body)) report("vectorized loop is not innermost");
         if (!scope.insert(s->var).second) report("loop variable i" + std::to_string(s->var) + " is bound twice");
         stmt(s->body);
         scope.erase(s->var);
@@ -336,6 +384,8 @@ struct Verifier {
         if (buffer_ok(s->buffer)) {
           const Buffer& b = p.buffers[s->buffer];
           if (!b.writable()) report("stores to read-only buffer " + b.name);
+          if (b.storage == Storage::Persistent && !init) report("stores to persistent buffer " + b.name + " outside an init kernel");
+          if (b.storage == Storage::Output && init) report("init kernel stores to output buffer " + b.name);
           if (b.dtype != s->value->type) report("stores a " + std::string(dtype_name(s->value->type)) + " into " + b.name);
         }
         return;
@@ -349,7 +399,7 @@ struct Verifier {
 }  // namespace
 
 std::vector<std::string> verify_program(const Program& p) {
-  Verifier v{p, {}, "", {}};
+  Verifier v{p, {}, "", {}, false};
   for (const Buffer& b : p.buffers) {
     v.where = "buffer " + b.name;
     int64_t bytes = static_cast<int64_t>(Type{b.dtype, b.shape}.byte_size());
@@ -371,12 +421,19 @@ std::vector<std::string> verify_program(const Program& p) {
             static_cast<int64_t>(p.inline_data[b.index].size()) != bytes)
           v.report("inline data is missing or the wrong size");
         break;
+      case Storage::Persistent:
+        if (b.offset < 0 || b.offset + bytes > p.persistent_bytes) v.report("lies outside the persistent memory");
+        break;
     }
   }
-  for (const Kernel& k : p.kernels) {
-    v.where = "kernel " + k.label;
-    v.scope.clear();
-    v.stmt(k.body);
+  for (bool init : {true, false}) {
+    for (const Kernel& k : init ? p.init_kernels : p.kernels) {
+      v.where = std::string(init ? "init kernel " : "kernel ") + k.label;
+      v.init = init;
+      v.scope.clear();
+      v.stmt(k.body);
+      if (init) v.no_caller_memory(k.body);
+    }
   }
   return v.errors;
 }

@@ -11,7 +11,7 @@ The project exists to learn how ML compilers work and to get hands-on performanc
 ```
 PyTorch model
   -> torch.export (ATen graph)      Python exporter: graph.json + weights.bin
-  -> Graph IR            constant folding, fusion, memory planning
+  -> Graph IR            constant folding, fusion, layout, memory planning
   -> Loop IR             tiling, vectorization, multi-threading
   -> C++ with SIMD intrinsics  -> clang++ -> shared library
   -> autotuner picks kernel parameters by measurement
@@ -32,11 +32,12 @@ Development machine: Apple M2, arm64, 4 performance + 4 efficiency cores, 24 GB,
 |---|---|
 | arm64, not x86 | SIMD target is **NEON** (128-bit, 4 x fp32, FMA via `vfmaq_f32`). No AVX. Codegen goes through a thin ISA layer so AVX2 can be added later without touching the loop IR. |
 | Apple clang ships no OpenMP | Threading uses our own small `std::thread` pool with a static `parallel_for`. No `libomp` dependency. |
-| 4P + 4E cores, no thread affinity API on macOS | Default to 4 threads and request high QoS so work lands on P-cores. Thread count is a tunable and is reported with every number. |
+| 4P + 4E cores, no thread affinity API on macOS | Default to one thread per performance core and request high QoS so work lands on them. Thread count is a tunable and is reported with every number. |
+| A laptop: battery power and Low Power Mode change the clock | Low Power Mode roughly halves single-core speed (measured in M4: 59 against an expected 110 GFLOP/s peak) and throttles sustained multi-core load. Every result file records the power state; numbers are compared only within one session. |
 | PyTorch and ONNX Runtime on macOS can route GEMM through Apple Accelerate | Accelerate may use hardware that NEON intrinsics cannot reach. Matching it on large GEMM may not be possible. See section 7 for how we report this. |
 | No NVIDIA GPU | Triton does not run here. The GPU milestone needs a Linux + CUDA machine (cloud or Colab). |
 
-Cache sizes for tiling come from `sysctl hw.perflevel0.*` at tune time, not from constants in the source.
+Cache sizes for tiling come from `sysctl hw.perflevel0.*` at tune time (M5). Until then the default schedule carries one hand-picked constant, a 64 KB working set against the 128 KB L1 data cache, chosen by measurement in M4.
 
 ## 3. Scope decisions
 
@@ -60,7 +61,7 @@ Two halves. The Python exporter walks the `ExportedProgram` and serializes it wi
 
 - SSA values with static shape and dtype. Nodes are pure. Constants are first-class.
 - One node produces one value, so a value is named by its node's index. Tuple-returning ATen ops are resolved in the importer.
-- 27 ops (`src/graph/ir.h`). Composite ops (`layer_norm`, `softmax`, `gemm` with bias) are kept whole. `gelu` and the causal form of `softmax` are never imported; fusion produces them.
+- 27 ops (`src/graph/ir.h`). Composite ops (`layer_norm`, `softmax`, `gemm` with bias) are kept whole. `gelu`, the causal form of `softmax`, and the transposed-operand form of `matmul` and `gemm` (`trans_b`) are never imported; passes produce them.
 - One function, `infer_type`, defines every op's typing rule. The builder uses it to type new nodes and the verifier uses it to re-check existing ones.
 - A text printer (`mlc dump`) and a verifier (shapes, dtypes, use-before-def). The verifier runs after import and before every interpreter run, and will run after every pass.
 - A **reference interpreter** in plain, unoptimized C++ executes any graph (`mlc run`). It is checked against PyTorch's golden logits and is then the oracle for every later stage. It frees each value after its last use and reports peak live bytes, which is the baseline memory planning has to beat.
@@ -74,39 +75,52 @@ Passes (`src/graph/passes.*`), in pipeline order. Each is a function from graph 
 | `cse` | Merges identical nodes and identical constants. Each layer rebuilds the same mask and the same scalars. |
 | `gelu` | Recognizes the nine-node tanh GELU expansion and emits one `Gelu`. |
 | `attention` | Recognizes mask + softmax + all-masked-row guard and emits one causal `Softmax` on the raw scores. The mask is recognized by evaluating it at compile time, whatever computes it. |
+| `layout` | Rewrites every matrix product `a @ b` to take `b` transposed (`trans_b`), so each output element is a dot product of two contiguous rows. Transposes already in the graph cancel (the output projection, `q @ k^T`); a transpose of a weight is left for `hoist`. |
 | `memory` | Applied at lowering (`src/loop/lower.cpp`). Liveness per value, in-place reuse for ops that read each element before writing it, then best-fit offset assignment with a coalescing free list. Reports arena bytes against the no-reuse total. |
+| `hoist` | Applied at lowering. Staging: a value that depends only on weights and constants is computed once when the model is loaded, by an init kernel writing persistent memory, instead of on every call. It is constant folding for values whose bytes the compiler does not have. |
 
-Every pass can be switched off by name (`--disable`), which is how ablations are built (`bench/ablate.py`).
+Every optimization at every level can be switched off by name (`--disable`), which is how ablations are built (`bench/ablate.py`). The loop-level names are `noalias`, `vectorize`, `vmath`, `regtile`, `cachetile`, `parallel` (sections 4.3 and 4.4).
 
 Fusions from the original plan that turned out not to be needed, or not yet:
 
 - **matmul + bias to `gemm`**: ATen already exports `addmm`, which imports as `gemm`.
-- **Residual add into the producer**: in-place reuse already makes the add write over its operand, so it costs no memory. Folding it into the `gemm` loop is a locality question that belongs with the GEMM kernel in M4.
+- **Residual add into the producer**: in-place reuse already makes the add write over its operand, so it costs no memory, and after M4 all 25 adds together are 0.2% of the run. Not done.
 - **General elementwise chains**: after `gelu` and `attention`, the only elementwise ops left in GPT-2 are the 25 residual and embedding adds and 24 multiplies by the attention scale. There is no chain left to fuse.
-- **The transposed output projection**: the export transposes the tied embedding (154 MB) on every call before the final `mm`. Folding it would duplicate the weight; the right fix is a matmul that reads its second operand transposed, which the M4 kernel's packing step does for free. Until then that one buffer is nearly the whole arena.
+- **The transposed output projection**: the export transposes the tied embedding (154 MB) on every call before the final `mm`. Resolved in M4 by `layout`: the product reads its second operand transposed, so the two transposes cancel and the embedding table is used as stored.
 
 ### 4.3 Loop IR
 
-- Statements: `For(var, extent, kind)`, `Store`, `Block`. Expressions: immediates, loop variables, `Load`, arithmetic and comparisons, `Select`, `Cast`, intrinsic calls (`exp`, `tanh`, `pow`, `sqrt`). `kind` is serial, parallel, or vectorized; only serial exists so far.
-- Accesses are multi-dimensional (`buf[i, j, k]`); flattening to one offset happens at codegen. Loop extents are constants, since shapes are static.
-- There are no scalar variables besides loop counters. Reductions accumulate through memory and temporaries are small buffers, so every dependence is a visible load or store. Promoting those to registers is M4 work.
-- A buffer is a typed, shaped view of storage: the arena, the weights file, a caller's input or output, or inline constant data. A graph `Reshape` lowers to a second view of the same storage and no code.
-- Storage is decided at lowering. With memory planning off, every computed value gets its own slice of the arena; with it on (the default), slices are reused once dead. The program records both sizes.
-- Each graph op lowers to a naive loop nest (`src/loop/lower.cpp`), one kernel per node. Optimizations are explicit, composable rewrites on that nest: `split`, `tile`, `reorder`, `fuse`, `unroll`, `vectorize`, `parallelize`.
-- A **schedule** is a list of those rewrites plus parameters. The autotuner searches over schedules; it never edits IR directly.
-- A loop IR interpreter (slow, tree-walking, bounds-checking every index) is the reference for what a loop program means. In M2 it checks lowering against the graph interpreter on small graphs; from M4 it checks that a scheduled nest still computes what the naive nest did. It is far too slow for the full model, so the full model is checked in compiled form against the golden logits.
+- Statements: `For(var, extent, kind)`, `Store`, `Block`. Expressions: immediates, loop variables, `Load`, arithmetic and comparisons, `Select`, `Cast`, intrinsic calls (`exp`, `tanh`, `pow`, `sqrt`).
+- A loop's extent is a constant or an expression of enclosing loop variables (the causal softmax loops over columns `0..i`). Its `kind` is serial, vectorized, or parallel. The kind never changes what the loop computes: it is a promise, checked when made, that the faster execution gives the same values up to the order of float additions.
+- Accesses are multi-dimensional (`buf[i, j, k]`); flattening to one offset happens at codegen.
+- There are no scalar variables besides loop counters. Reductions accumulate through memory and temporaries are small buffers, so every dependence is a visible load or store. That is what the legality analysis reads. Registers appear only in generated code: a vectorized reduction keeps its accumulator in vector registers.
+- A buffer is a typed, shaped view of storage: the arena, the weights file, persistent memory (filled at load time), a caller's input or output, or inline constant data. A graph `Reshape` lowers to a second view of the same storage and no code.
+- Storage and stage are decided at lowering. With memory planning off, every computed value gets its own slice of the arena; with it on (the default), slices are reused once dead. A program has two kernel lists: init kernels, run once at load, and kernels, run per call.
+- Each graph op lowers to a naive loop nest (`src/loop/lower.cpp`), one kernel per node. Optimizations are explicit rewrites on that nest (`src/loop/schedule.*`): `split`, `interchange`, `unroll_and_jam`, `vectorize`, `parallelize`. Cache tiling is `split` followed by `interchange`. A rewrite names its loop by the loop variable and either proves itself legal or throws and changes nothing.
+- **Legality is dependence analysis.** A loop's iterations are independent when, for every buffer the body writes, there is an axis along which every access is at `c * v + r` with the same stride `c` and `r` ranging over less than `c`: each iteration owns a slice. `interchange`, `unroll_and_jam`, and `parallelize` require it. `vectorize` requires each store to be either elementwise over consecutive addresses or a sum or maximum into one element that nothing else in the loop touches. Two buffers that share bytes under different shapes are treated as dependent.
+- A **schedule** is which rewrites to apply and with what parameters. M4 has one default schedule (`schedule_program`, parameters in `ScheduleOptions`): vectorize every innermost loop that can be, run the outermost loop of every large kernel on threads, and tile matrix products as below. The autotuner (M5) searches over the parameters; it never edits IR directly.
+- A loop IR interpreter (slow, tree-walking, bounds-checking every index) is the reference for what a loop program means. It runs every loop serially whatever its kind, so a scheduled nest must compute bit for bit what the naive nest did, and the tests check exactly that. It is far too slow for the full model, which is checked in compiled form against the golden logits.
 
-GEMM dominates runtime (768x768, 768x3072, and the 768x50257 output projection), so it gets the most structure: cache-level tiling, operand packing, and a register-tiled micro-kernel with an unrolled FMA body. Outer loops come from the loop IR; the micro-kernel is generated from a parameterized template (`MR`, `NR`, unroll factor).
+**The matrix product.** GEMM is 97% of the unoptimized run (768x768, 768x3072, and the 768x50257 output projection). The original plan was the BLIS design: pack both operands and call a micro-kernel generated from a template. What was built instead needs no packing and no template:
+
+- `layout` puts every product in dot form, `C[i,j] = sum_p A[i,p] * Bt[j,p]`, where both operands are read along contiguous rows.
+- `unroll_and_jam` on `i` and `j` turns the dot-product loop into a tile of `rows x cols` dot products that share their loads (4x5 by default: 20 accumulators, 9 loads, 29 of the 32 vector registers). `vectorize` on `p` keeps each accumulator in a register. That loop is the micro-kernel, and it came out of two general rewrites.
+- Cache tiling blocks the operand with more rows so that a block, plus the rows it is multiplied against, stays in L1. The other operand streams from L2.
+- Leftover rows and columns are jammed too, into a smaller tile, because a leftover handled one row at a time has too few accumulators to keep the FMA units busy.
+
+Measured in isolation (`mlc gemm`, `bench/gemm.py`) these kernels reach 92 to 97% of the same loop's in-cache rate. Why not BLIS: packing a weight costs as much as multiplying by it at `T=16`, and the alternative of packing at load time costs the same memory as transposing at load time, which dot form needs for 48 of the 73 products and not for the largest one.
 
 ### 4.4 Codegen and runtime
 
-- Loop IR to C++ (`mlc compile`). M2 emits scalar code only: one function per kernel, plus a table of kernels that the runtime walks. NEON intrinsics arrive in M4; vectorized loops will emit a vector body plus a scalar tail.
-- The runtime linked into generated code (`runtime/mlc_runtime.*`) is handwritten and does not grow kernels: arena allocation, weight mmap, per-kernel timing, and later the thread pool. It exposes a small C API (`mlc_open`, `mlc_run`, `mlc_run_profiled`, `mlc_close`) that Python calls through `ctypes` and `mlc exec` calls through `dlopen`.
+- Loop IR to C++ (`mlc compile`). A serial loop is transcribed. A vectorized loop becomes a loop of SIMD intrinsics, with `interleave` independent accumulator sets for reductions, followed by a scalar loop for leftover iterations; `a + b * c` is emitted as one fused multiply-add. A parallel loop becomes a function of an index range, passed to the runtime's thread pool.
+- The instruction set is one table (`src/codegen/isa.h`): the name of each vector operation. NEON is the only entry. Vector `exp` and `tanh` are handwritten polynomials in `runtime/mlc_neon.h`, accurate to 2.5e-7 and tested against the C library.
+- Each kernel's buffers reach the loops as `__restrict` parameters wherever the memory plan shows they do not overlap (`noalias`). In M2 the C++ compiler refused to vectorize 48 of 49 matrix products because it could not prove that; the planner can.
+- The runtime linked into generated code (`runtime/mlc_runtime.*`) is handwritten and does not grow kernels: arena and persistent allocation, weight mmap, the init kernels at load, per-kernel timing, and a thread pool (`std::thread`, one contiguous piece of the range per thread, workers spin briefly before sleeping). It exposes a small C API (`mlc_open`, `mlc_set_threads`, `mlc_run`, `mlc_run_profiled`, `mlc_close`) that Python calls through `ctypes` and `mlc exec` calls through `dlopen`.
 - Generated code is kept on disk and readable. Being able to read the output is a debugging feature.
 
 ### 4.5 Autotuner
 
-- Tunables: tile sizes per cache level, `MR` x `NR`, unroll factor, pack or no pack, parallel loop choice and grain, thread count.
+- Tunables: the register tile (`rows` x `cols`), the cache block size, which operand is blocked, interleave factors, the size below which a kernel stays on one thread, thread count.
 - Tunes each distinct kernel instance (op + shapes) in isolation on a micro-benchmark, then validates the composed model.
 - Search: random search first, then an evolutionary refinement if random leaves measurable gains. A learned cost model is out of scope.
 - Candidate kernels are compiled to small shared libraries and timed in-process through `dlopen`.
@@ -139,11 +153,11 @@ Each milestone ends with a short entry in `docs/log.md`: what was built, the num
 - **Per pass:** every graph pass and every loop rewrite has a differential test (interpret before, interpret after, compare).
 - **Per kernel:** each generated kernel is tested standalone against a naive scalar reference on random inputs, including sizes that are not multiples of the vector width or tile size.
 - Build both the compiler and the generated code with `-fsanitize=address,undefined` in the test configuration.
-- `-ffast-math` is off by default. If it is ever enabled it is a named, benchmarked option.
+- `-ffast-math` is off by default. If it is ever enabled it is a named, benchmarked option. The C++ compiler therefore never reorders float arithmetic. Our own vectorizer does, in one place: a vectorized sum adds its terms in lanes. That is a decision made in the loop IR, visible in `mlc loops`, and it is what the tolerance above is for.
 
 ## 7. Benchmarking rules
 
-- Same machine, on power, nothing else running. Same inputs, fp32, batch 1.
+- Same machine, on AC power with Low Power Mode off, nothing else running. Same inputs, fp32, batch 1. Systems are compared within one run of the harness, never across sessions.
 - Baselines run under `torch.inference_mode()`. `torch.compile` and ONNX Runtime get their warmup and compile excluded, as do we.
 - Thread count is set explicitly and equally for every system. Report 1-thread and 4-thread results separately. Note that Accelerate's GEMM does not respond to this setting, so PyTorch's "1 thread" row is not a single-core NEON number.
 - At least 5 warmup runs, then at least 30 timed runs. Report median and min. Keep the raw samples.
@@ -169,7 +183,7 @@ src/
   tune/         search, measurement, cache
   gpu/          Triton emitter (M7)
   main.cpp      the `mlc` driver
-runtime/        handwritten C++ linked into generated code: arena, thread pool, weight loader
+runtime/        handwritten C++ linked into generated code: arena, thread pool, weight loader, NEON vector math
 bench/          Python: harness, baselines, result tables
   support/      JSON reader, mmap, .npy reader
 tests/          C++ unit and differential tests; end-to-end checks against golden logits (ctest)
@@ -183,8 +197,10 @@ The compiler depends on the C++ standard library and nothing else. The JSON read
 
 | Item | Plan |
 |---|---|
-| The output projection's weight is transposed at run time | Open until M4. One 154 MB buffer and about 0.1 s per call; see section 4.2. |
-| GEMM cannot match Accelerate on M-series | Confirmed in M0 (see section 7). Measure our kernel standalone in M4 against both Accelerate and ONNX Runtime. Report the gap; do not hide it inside a whole-model number. |
+| The output projection's weight is transposed at run time | Resolved in M4 (`layout`, section 4.2). |
+| GEMM cannot match Accelerate on M-series | Confirmed in M0 and measured in M4 (`bench/results/gemm_T*.md`): Accelerate is several times faster than any NEON kernel on large products. We report the gap. |
+| Transposed weights double the weights' memory | Open. 340 MB of persistent memory holds transposed copies of the 48 dense-layer weights. The originals stay in the mapped file and can be paged out, but the address space and load time (about 0.1 s) are paid. Alternatives for M5: store the weights transposed in the weights file, or transpose per call in cache-sized blocks. |
+| Numbers so far were taken on battery in Low Power Mode | Open. All of M4's tables are internally consistent but about half speed, and sustained four-thread runs at `T=1024` are throttled. Re-measure on AC before M6. |
 | `torch.compile` CPU backend on macOS arm64 may be fragile | Resolved in M0: it runs and matches golden logits. |
 | Export produces ops or patterns we did not expect | Resolved in M1: all 37 ops lower. The surprises (tied embedding transposed at run time, a mask computed from constants on every call, no-op expands, permute chains) are recorded in `docs/log.md` and are M3's work list. |
 | C++ slows iteration on pattern-matching passes | Build a small pattern-matching helper and the IR printer early, in M1. Keep debug builds fast. |

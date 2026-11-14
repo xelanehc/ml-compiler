@@ -13,7 +13,7 @@ namespace {
 class Machine {
  public:
   Machine(const Program& p, std::span<const std::byte> weights, std::span<const void* const> inputs, std::span<void* const> outputs)
-      : p_(p), arena_(static_cast<size_t>(p.arena_bytes)) {
+      : p_(p), arena_(static_cast<size_t>(p.arena_bytes)), persistent_(static_cast<size_t>(p.persistent_bytes)) {
     if (inputs.size() != p.inputs.size() || outputs.size() != p.outputs.size()) throw LoopError("wrong number of inputs or outputs");
     if (static_cast<int64_t>(weights.size()) < p.weights_bytes) throw LoopError("weights are smaller than the program expects");
     for (const Buffer& b : p.buffers) {
@@ -23,20 +23,23 @@ class Machine {
         case Storage::Input: base_.push_back(static_cast<std::byte*>(const_cast<void*>(inputs[b.index]))); break;
         case Storage::Output: base_.push_back(static_cast<std::byte*>(outputs[b.index])); break;
         case Storage::Inline: base_.push_back(const_cast<std::byte*>(p.inline_data[b.index].data())); break;
+        case Storage::Persistent: base_.push_back(persistent_.data() + b.offset); break;
       }
     }
   }
 
   void run() {
-    for (const Kernel& k : p_.kernels) {
-      vars_.clear();
-      exec(k.body);
+    for (const std::vector<Kernel>* list : {&p_.init_kernels, &p_.kernels}) {
+      for (const Kernel& k : *list) {
+        vars_.clear();
+        exec(k.body);
+      }
     }
   }
 
  private:
   const Program& p_;
-  std::vector<std::byte> arena_;
+  std::vector<std::byte> arena_, persistent_;
   std::vector<std::byte*> base_;   // start of each buffer's data
   std::vector<int64_t> vars_;      // current value of each loop variable, by VarId
 
@@ -153,7 +156,10 @@ class Machine {
     switch (s->kind) {
       case StmtKind::For: {
         if (static_cast<size_t>(s->var) >= vars_.size()) vars_.resize(s->var + 1);
-        for (int64_t i = 0; i < s->extent; ++i) {
+        // The extent is evaluated once, on entry. The loop kind is ignored:
+        // serial execution in order is what every kind has to be equal to.
+        const int64_t extent = eval_int(s->extent);
+        for (int64_t i = 0; i < extent; ++i) {
           vars_[s->var] = i;
           exec(s->body);
         }
