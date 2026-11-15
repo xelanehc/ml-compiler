@@ -193,7 +193,7 @@ tuning/         cache.json: schedules measured by `mlc tune` on the development 
 bench/          Python: harness, baselines, result tables
   support/      JSON reader, mmap, .npy reader
 tests/          C++ unit and differential tests; end-to-end checks against golden logits (ctest)
-docs/           writeup.md (results), log.md (history), export_ops.md
+docs/           guide/ (the full explanation, also built as ml-compiler-guide.pdf), writeup.md (results), log.md (history), export_ops.md
 build/          CMake build trees (`build/release`, `build/asan`); generated C++ and libraries under `build/release/gen/` (gitignored)
 ```
 

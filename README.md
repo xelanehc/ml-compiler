@@ -4,7 +4,7 @@ A small ahead-of-time ML compiler that runs GPT-2 small on a CPU.
 
 It takes the real PyTorch model through `torch.export`, lowers it into its own graph IR, optimizes the graph, lowers again to a loop-level IR, applies tiling, vectorization, and multi-threading, and emits C++ with SIMD intrinsics. An autotuner picks kernel parameters by measurement. The compiler itself is written in C++, and the code it generates calls no BLAS library.
 
-**Status:** the CPU compiler is complete (M0 to M6). GPT-2 compiles end to end and reproduces PyTorch's logits at every sequence length. Against ONNX Runtime, whose kernels use the same SIMD units, it is level at T=1024 on one and four threads, 1 to 6% behind at shorter lengths on one thread, and 12 to 57% behind on four. It does not approach PyTorch, whose matrix products run on Apple Accelerate. The results and what explains them are in [docs/writeup.md](docs/writeup.md); the design is in [STEERING.md](STEERING.md) and the history in [docs/log.md](docs/log.md). The Triton GPU backend (M7) is not started.
+**Status:** the CPU compiler is complete (M0 to M6). GPT-2 compiles end to end and reproduces PyTorch's logits at every sequence length. Against ONNX Runtime, whose kernels use the same SIMD units, it is level at T=1024 on one and four threads, 1 to 6% behind at shorter lengths on one thread, and 12 to 57% behind on four. It does not approach PyTorch, whose matrix products run on Apple Accelerate. A full explanation of the project, written for someone new to compilers, is in [docs/guide/](docs/guide/README.md) (also as one file: [docs/ml-compiler-guide.pdf](docs/ml-compiler-guide.pdf)). The results and what explains them are in [docs/writeup.md](docs/writeup.md); the design is in [STEERING.md](STEERING.md) and the history in [docs/log.md](docs/log.md). The Triton GPU backend (M7) is not started.
 
 ## Pipeline
 
@@ -160,5 +160,5 @@ tuning/       cache.json: schedules measured by the autotuner on the development
 runtime/      handwritten C++ linked into generated code: arena, thread pool, weight loader, NEON exp and tanh
 bench/        Python benchmark harness and baselines
 tests/
-docs/         writeup.md (results), log.md (what each milestone built and found)
+docs/         guide/ (the full explanation), writeup.md (results), log.md (what each milestone built and found)
 ```
